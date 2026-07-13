@@ -45,12 +45,19 @@ def _catalogo_materiales(mb5b: pd.DataFrame) -> pd.DataFrame:
 def construir(
     mb51: str | None = None,
     mb5b: str | None = None,
+    mb51_archivos=None,
+    mb5b_archivos=None,
     fecha_fin: str | None = None,
 ) -> ResultadoMRP:
-    """Ejecuta el pipeline completo y devuelve todas las tablas."""
+    """
+    Ejecuta el pipeline completo y devuelve todas las tablas.
+
+    Los datos pueden venir de carpetas en disco (mb51 / mb5b) o de archivos
+    subidos en el navegador (mb51_archivos / mb5b_archivos).
+    """
     # 1) Cargar fuentes
-    df_mb51 = data_loading.cargar_mb51(mb51)
-    df_mb5b = data_loading.cargar_mb5b(mb5b)
+    df_mb51 = data_loading.cargar_mb51(mb51, archivos=mb51_archivos)
+    df_mb5b = data_loading.cargar_mb5b(mb5b, archivos=mb5b_archivos)
 
     # 2) Transformar -> serie mensual completa (stock de MB5B en todos los meses)
     desag = transform.demanda_desagregada(df_mb51)
@@ -97,6 +104,8 @@ def _ordenar_tabla_final(tabla: pd.DataFrame) -> pd.DataFrame:
         "Metodo",
         "Pronostico",
         "Pronostico_redondeado",
+        "Tiempo_hasta_demanda",
+        "Dias_hasta_demanda",
         "MesPronosticado",
         "PR_Periodos_Hasta_Prox",
         "PR_Media_Intervalo",

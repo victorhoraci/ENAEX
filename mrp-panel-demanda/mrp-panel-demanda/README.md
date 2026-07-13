@@ -85,21 +85,23 @@ Se abrirá en el navegador (por defecto `http://localhost:8501`).
 
 ---
 
-## 🔄 Cómo actualizar los datos cada mes
+## 🔄 Cómo actualizar los datos
 
 El panel se alimenta de dos descargas de **SAP HANA**:
 
-| Transacción | Qué es | Cada cuánto | Carpeta |
-|---|---|---|---|
-| **MB51** | Movimientos de material (ingresos 101, consumos 201/261) | Mensual o acumulado | `data/MB51/` |
-| **MB5B** | Stock del mes por material | **Un archivo por mes** | `data/MB5B/` |
+| Transacción | Qué es | Cada cuánto | Carpeta | Al actualizar |
+|---|---|---|---|---|
+| **MB51** | Movimientos (ingresos 101, consumos 201/261) | **Semanal** | `data/MB51/` | **Reemplaza** al anterior |
+| **MB5B** | Stock del mes por material | **Mensual** | `data/MB5B/` | **Se agrega** uno nuevo |
 
-1. Descarga de SAP el Excel de **MB51** (desde 01-01-2023 hasta hoy) y déjalo en
-   `data/MB51/`. Puedes reemplazar el anterior o mantener varios: se leen todos.
-2. Descarga el **MB5B** del mes recién cerrado y déjalo en `data/MB5B/`
-   **sin borrar los meses anteriores** (cada archivo es la foto de un mes).
-3. En el panel, pulsa **Rerun** (menú ⋮) o refresca la página. El cálculo se
-   rehace solo.
+Tienes dos formas de actualizar:
+
+- **Desde el panel** (recomendado): pestaña **➕ Agregar datos**. Subes el MB51
+  (reemplaza) o el MB5B (se agrega) y el panel recalcula solo. *Nota:* en
+  Streamlit Cloud estos archivos son temporales; para que queden permanentes,
+  súbelos al repo o usa el panel en tu PC.
+- **Desde las carpetas**: deja los Excel directamente en `data/MB51/` y
+  `data/MB5B/` (por ejemplo subiéndolos a GitHub) y refresca el panel.
 
 El panel reconoce las columnas por su nombre y tolera variantes comunes de los
 encabezados de SAP. Si falta una columna clave, avisa cuál no encontró.
@@ -117,16 +119,21 @@ encabezados de SAP. Si falta una columna clave, avisa cuál no encontró.
    - **CV²** = (desviación ÷ promedio)² del tamaño de la demanda.
    - Resultado: *Suave*, *Errática*, *Intermitente* o *Irregular*
      (o *Sin demanda* si nunca hubo consumo). Cortes: ADI = 1.32, CV² = 0.49.
-4. **Método según el tipo:**
-   | Tipo | Método |
-   |---|---|
-   | Suave | **SES** — suavizamiento exponencial simple |
-   | Errática | **COMBINADO** — promedio de SES + media móvil 3 + media móvil 6 |
-   | Intermitente / Irregular | **SBA** (Croston-SBA) + **Proceso de Renovación** |
-5. **Proceso de Renovación** (solo intermitentes): estima cuándo ocurrirá la
-   próxima demanda (*Periodos_Hasta_Prox*), su tamaño esperado y los intervalos
-   de confianza al 95 %.
+4. **Método y "tiempo hasta la próxima demanda" según el tipo:**
+   | Tipo | Método | Tiempo hasta demanda |
+   |---|---|---|
+   | **Constante** (antes "Suave") | **SES** | Días hasta el próximo mes |
+   | **Errática** | **COMBINADO** (SES + media móvil 3 + media móvil 6) | Días hasta el próximo mes |
+   | **Intermitente / Irregular** con **< 4** demandas | **SBA** (Croston-SBA) | **Indeterminado** |
+   | **Intermitente / Irregular** con **≥ 4** demandas | **PR** (Proceso de Renovación) | **Días** estimados hasta la próxima demanda |
+   | **Sin demanda** | — | — |
+5. **Proceso de Renovación** (materiales PR): estima cuándo ocurrirá la próxima
+   demanda (en meses, que el panel convierte a días), su tamaño esperado y los
+   intervalos de confianza al 95 %.
 6. **Resultado final** — se toma el último pronóstico de cada material.
+
+El umbral entre SBA y PR (4 demandas) y la conversión de meses a días se ajustan
+en `mrp/config.py` (`MIN_DEMANDAS_PR`, `DIAS_POR_MES`).
 
 Todos los parámetros (α = 0.3, cortes de clasificación, horizonte = 12) están en
 [`mrp/config.py`](mrp/config.py) y se ajustan sin tocar la lógica.
@@ -177,5 +184,6 @@ de GitHub y apunta a `app.py`.
   que un mismo material en distintos centros no se mezcle.
 - La desviación estándar usa el estimador **muestral (n-1)**, igual que
   `List.StandardDeviation` de Power Query.
-- El pronóstico de demanda intermitente no se emite hasta tener al menos
-  **3 eventos** de demanda (parámetro `MIN_EVENTOS`).
+- La demanda intermitente/irregular usa **PR** solo si tiene **4 o más**
+  demandas históricas (`MIN_DEMANDAS_PR`); con menos, usa **SBA** y su tiempo
+  hasta la próxima demanda queda como **"Indeterminado"**.

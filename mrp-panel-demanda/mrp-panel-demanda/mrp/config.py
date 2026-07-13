@@ -50,14 +50,26 @@ CLASES_MOVIMIENTO = ["101", "201", "261"]
 CORTE_ADI = 1.32   # frontera intermitencia
 CORTE_CV2 = 0.49   # frontera variabilidad
 
-# Mapa: tipo de demanda -> método de pronóstico recomendado.
+# Mapa base: tipo de demanda -> método de pronóstico.
+# Nota: para Intermitente / Irregular el método final (SBA o PR) depende de
+# cuántas demandas históricas tenga el material (ver MIN_DEMANDAS_PR).
 METODO_POR_TIPO = {
-    "Suave": "SES",
+    "Constante": "SES",        # antes "Suave"
     "Errática": "COMBINADO",
-    "Intermitente": "SBA",
-    "Irregular": "SBA",
+    "Intermitente": "SBA",     # o "PR" si tiene >= MIN_DEMANDAS_PR demandas
+    "Irregular": "SBA",        # o "PR" si tiene >= MIN_DEMANDAS_PR demandas
     "Sin demanda": "Sin cálculo",
 }
+
+# Para demanda Intermitente / Irregular:
+#   - con MENOS de MIN_DEMANDAS_PR demandas históricas -> método SBA
+#     (tiempo hasta la próxima demanda = "Indeterminado")
+#   - con MIN_DEMANDAS_PR o más -> método PR (Proceso de Renovación)
+#     (tiempo hasta la próxima demanda estimado en días)
+MIN_DEMANDAS_PR = 4
+
+# Para expresar en DÍAS los intervalos que el modelo calcula en meses.
+DIAS_POR_MES = 30
 
 
 # --------------------------------------------------------------------------

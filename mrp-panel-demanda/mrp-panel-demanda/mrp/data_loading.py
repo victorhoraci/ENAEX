@@ -98,22 +98,30 @@ def _parse_numero(serie: pd.Series) -> pd.Series:
 # --------------------------------------------------------------------------
 # MB51 - Movimientos de material
 # --------------------------------------------------------------------------
-def cargar_mb51(ruta: str | Path | None = None) -> pd.DataFrame:
+def cargar_mb51(ruta: str | Path | None = None, archivos=None) -> pd.DataFrame:
     """
     Lee el/los Excel de MB51 y devuelve los movimientos ya filtrados por las
     clases de movimiento relevantes (101, 201, 261).
+
+    Puede leer desde:
+      - una carpeta/archivo en disco (parámetro `ruta`), o
+      - una lista de archivos subidos en el navegador (parámetro `archivos`,
+        objetos tipo file de st.file_uploader).
 
     Columnas de salida:
         Material (str), Centro (str), Clase de movimiento (str),
         Fecha contabiliz. (datetime), Ctd.en UM entrada (float)
     """
-    ruta = ruta or config.CARPETA_MB51
-    archivos = _listar_excels(ruta)
-    if not archivos:
-        raise FileNotFoundError(
-            f"No se encontraron archivos MB51 en: {ruta}. "
-            "Deja el/los Excel de MB51 en esa carpeta."
-        )
+    if archivos:
+        fuentes = list(archivos)
+    else:
+        ruta = ruta or config.CARPETA_MB51
+        fuentes = _listar_excels(ruta)
+        if not fuentes:
+            raise FileNotFoundError(
+                f"No se encontraron archivos MB51 en: {ruta}. "
+                "Deja el/los Excel de MB51 en esa carpeta o súbelos en el panel."
+            )
 
     mapeo = {
         "Material": ("Material",),
@@ -125,7 +133,7 @@ def cargar_mb51(ruta: str | Path | None = None) -> pd.DataFrame:
                              "Cantidad en UM entrada", "Ctd en UM entrada"),
     }
 
-    partes = [_renombrar(pd.read_excel(a, sheet_name=0), mapeo) for a in archivos]
+    partes = [_renombrar(pd.read_excel(a, sheet_name=0), mapeo) for a in fuentes]
     df = pd.concat(partes, ignore_index=True)
 
     faltan = [c for c in mapeo if c not in df.columns]
@@ -146,9 +154,12 @@ def cargar_mb51(ruta: str | Path | None = None) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # MB5B - Stock mensual
 # --------------------------------------------------------------------------
-def cargar_mb5b(ruta: str | Path | None = None) -> pd.DataFrame:
+def cargar_mb5b(ruta: str | Path | None = None, archivos=None) -> pd.DataFrame:
     """
     Lee todos los Excel de MB5B (uno por mes) y los concatena.
+
+    Puede leer desde una carpeta en disco (`ruta`) o desde archivos subidos en
+    el navegador (`archivos`, objetos de st.file_uploader).
 
     Columnas de salida:
         Material (str), Descripcion del material (str),
@@ -156,13 +167,16 @@ def cargar_mb5b(ruta: str | Path | None = None) -> pd.DataFrame:
         Stock inicial, Total ctd.entrada mcia., Total cantidades salida,
         Stock de cierre (float)
     """
-    ruta = ruta or config.CARPETA_MB5B
-    archivos = _listar_excels(ruta)
-    if not archivos:
-        raise FileNotFoundError(
-            f"No se encontraron archivos MB5B en: {ruta}. "
-            "Deja los Excel mensuales de MB5B en esa carpeta."
-        )
+    if archivos:
+        fuentes = list(archivos)
+    else:
+        ruta = ruta or config.CARPETA_MB5B
+        fuentes = _listar_excels(ruta)
+        if not fuentes:
+            raise FileNotFoundError(
+                f"No se encontraron archivos MB5B en: {ruta}. "
+                "Deja los Excel mensuales de MB5B en esa carpeta o súbelos en el panel."
+            )
 
     mapeo = {
         "Material": ("Material",),
@@ -179,9 +193,9 @@ def cargar_mb5b(ruta: str | Path | None = None) -> pd.DataFrame:
     }
 
     partes = []
-    for archivo in archivos:
+    for archivo in fuentes:
         df = _renombrar(pd.read_excel(archivo, sheet_name=0), mapeo)
-        df["Source.Name"] = archivo.name
+        df["Source.Name"] = getattr(archivo, "name", str(archivo))
         partes.append(df)
     df = pd.concat(partes, ignore_index=True)
 
@@ -202,3 +216,67 @@ def cargar_mb5b(ruta: str | Path | None = None) -> pd.DataFrame:
 
     df = df.dropna(subset=["Material", "De fecha"])
     return df.reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# Guardar archivos nuevos (para la sección "Agregar datos" del panel)
+# --------------------------------------------------------------------------
+def reemplazar_mb51(archivo, carpeta: str | Path | None = None) -> str:
+    """
+    Guarda un nuevo Excel de MB51 REEMPLAZANDO el/los anteriores (MB51 se
+    descarga cada semana y siempre pisa al previo). Devuelve el nombre guardado.
+    """
+    carpeta = Path(carpeta or config.CARPETA_MB51)
+    carpeta.mkdir(parents=True, exist_ok=True)
+    # Borrar Excel anteriores (se conserva cualquier .gitkeep)
+    for viejo in carpeta.iterdir():
+        if viejo.suffix.lower() in (".xlsx", ".xls"):
+            viejo.unlink()
+    destino = carpeta / getattr(archivo, "name", "MB51.xlsx")
+    with open(destino, "wb") as f:
+        f.write(archivo.getbuffer() if hasattr(archivo, "getbuffer") else archivo.read())
+    return destino.name
+
+
+def agregar_mb5b(archivo, carpeta: str | Path | None = None) -> str:
+    """
+    Guarda un nuevo Excel de MB5B SIN borrar los anteriores (cada mes se agrega
+    uno más). Si el nombre ya existe, lo sobreescribe. Devuelve el nombre.
+    """
+    carpeta = Path(carpeta or config.CARPETA_MB5B)
+    carpeta.mkdir(parents=True, exist_ok=True)
+    destino = carpeta / getattr(archivo, "name", "MB5B.xlsx")
+    with open(destino, "wb") as f:
+        f.write(archivo.getbuffer() if hasattr(archivo, "getbuffer") else archivo.read())
+    return destino.name
+
+
+def estado_mb5b(carpeta: str | Path | None = None) -> dict:
+    """
+    Revisa qué meses de MB5B hay cargados y si falta el del mes recién cerrado.
+    Devuelve un dict con: meses (lista de Timestamps), ultimo, falta (bool),
+    mes_faltante (Timestamp | None) y n_archivos.
+    """
+    carpeta = Path(carpeta or config.CARPETA_MB5B)
+    archivos = _listar_excels(carpeta)
+    meses: list[pd.Timestamp] = []
+    if archivos:
+        try:
+            df = cargar_mb5b(carpeta)
+            meses = sorted(df["De fecha"].dt.to_period("M").dt.to_timestamp().unique())
+        except Exception:
+            meses = []
+
+    # Mes recién cerrado (el que deberían haber cargado al inicio de este mes)
+    mes_cerrado = (pd.Timestamp.today().to_period("M") - 1).to_timestamp()
+    falta = bool(meses) and (mes_cerrado not in set(meses))
+    if not meses:
+        falta = True
+
+    return {
+        "meses": meses,
+        "ultimo": meses[-1] if meses else None,
+        "falta": falta,
+        "mes_faltante": mes_cerrado if falta else None,
+        "n_archivos": len(archivos),
+    }

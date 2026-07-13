@@ -39,6 +39,7 @@ MATERIALES = [
     (100006, "MANOMETRO GLICERINA 0-10 BAR", "erratica"),
     (100007, "REPUESTO OBSOLETO SIN USO", "sin_demanda"),
     (100008, "ACOPLE FLEXIBLE TIPO L095", "intermitente"),
+    (100009, "REPUESTO CRITICO USO MUY RARO", "intermitente_pocas"),
 ]
 
 
@@ -55,6 +56,13 @@ def _demanda_mensual(patron: str, n: int) -> np.ndarray:
         for i in range(n):
             if rng.random() < 0.35:  # ~1 de cada 3 meses
                 d[i] = rng.integers(5, 40)
+        return d
+    if patron == "intermitente_pocas":
+        # Solo 2 demandas en toda la serie -> método SBA, tiempo "Indeterminado"
+        d = np.zeros(n)
+        posiciones = rng.choice(n, size=2, replace=False)
+        for pos in posiciones:
+            d[pos] = rng.integers(5, 30)
         return d
     if patron == "sin_demanda":
         return np.zeros(n)

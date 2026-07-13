@@ -27,7 +27,7 @@ def _clasificar_fila(adi: float | None, cv2: float | None) -> str:
     if adi is None or cv2 is None or pd.isna(adi) or pd.isna(cv2):
         return "Sin demanda"
     if adi < config.CORTE_ADI and cv2 < config.CORTE_CV2:
-        return "Suave"
+        return "Constante"
     if adi < config.CORTE_ADI and cv2 >= config.CORTE_CV2:
         return "Errática"
     if adi >= config.CORTE_ADI and cv2 < config.CORTE_CV2:
@@ -67,6 +67,14 @@ def clasificar_demanda(serie: pd.DataFrame) -> pd.DataFrame:
 
         tipo = _clasificar_fila(adi, cv2)
         metodo = config.METODO_POR_TIPO.get(tipo, "Sin cálculo")
+
+        # Para Intermitente / Irregular el método depende de cuántas demandas
+        # históricas haya: pocas -> SBA; suficientes -> PR (proceso de renovación).
+        if tipo in ("Intermitente", "Irregular"):
+            if meses_con_demanda >= config.MIN_DEMANDAS_PR:
+                metodo = "PR"
+            else:
+                metodo = "SBA"
 
         filas.append({
             "Material": material,

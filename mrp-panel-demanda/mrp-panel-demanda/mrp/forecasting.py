@@ -288,8 +288,8 @@ def _dist_tamano(cv):
 
 
 def pronostico_pr(base: pd.DataFrame) -> pd.DataFrame:
-    """Proceso de renovación completo (una fila por período) para SBA."""
-    datos = base[base["Metodo"] == "SBA"].copy()
+    """Proceso de renovación completo (una fila por período) para método PR."""
+    datos = base[base["Metodo"] == "PR"].copy()
     partes = []
     for material, grupo in datos.groupby("Material", sort=True):
         g = grupo.sort_values("FechaMes").reset_index(drop=True)
@@ -301,7 +301,7 @@ def pronostico_pr(base: pd.DataFrame) -> pd.DataFrame:
 
 
 def pronostico_pr_final(base: pd.DataFrame) -> pd.DataFrame:
-    """Solo la ÚLTIMA fila del proceso de renovación por material (Metodo == 'SBA')."""
+    """Solo la ÚLTIMA fila del proceso de renovación por material (Metodo == 'PR')."""
     completo = pronostico_pr(base)
     if completo.empty:
         return completo
@@ -316,6 +316,13 @@ def pronostico_pr_final(base: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # CONSOLIDACIÓN  ->  ResultadoFinal (una fila por Material + Centro)
 # --------------------------------------------------------------------------
+def _dias_hasta_proximo_mes(hoy: pd.Timestamp | None = None) -> int:
+    """Días de calendario que faltan desde hoy hasta el 1° del próximo mes."""
+    hoy = (hoy or pd.Timestamp.today()).normalize()
+    prox = (hoy.to_period("M") + 1).to_timestamp()
+    return int((prox - hoy).days)
+
+
 def resultado_final(
     ses: pd.DataFrame,
     combinado: pd.DataFrame,
@@ -324,46 +331,60 @@ def resultado_final(
     clasificacion: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Toma el ÚLTIMO pronóstico de cada material (según su método), agrega los
-    materiales 'Sin demanda' con pronóstico 0, y le pega la información del
-    proceso de renovación (tiempo hasta próxima demanda, intervalo, etc.).
+    Consolida una fila por Material + Centro con el último pronóstico y el
+    'tiempo hasta la próxima demanda' según el método:
+
+      - Constante (SES) / Errática (COMBINADO): pronóstico del próximo mes;
+        tiempo = días que faltan hasta el próximo mes.
+      - Intermitente / Irregular con pocas demandas (SBA): tiempo = "Indeterminado".
+      - Intermitente / Irregular con >= MIN_DEMANDAS_PR (PR): pronóstico = tamaño
+        esperado; tiempo = días estimados hasta la próxima demanda.
+      - Sin demanda: pronóstico 0.
     """
     def _sel(df, col):
+        vacio = pd.DataFrame(columns=["Material", "Centro", "FechaMes",
+                                      "Tipo_demanda", "Metodo", "Pronostico"])
         if df.empty or col not in df.columns:
-            return pd.DataFrame(columns=["Material", "Centro", "FechaMes",
-                                         "Tipo_demanda", "Metodo", "Pronostico"])
+            return vacio
         out = df[["Material", "Centro", "FechaMes", "Tipo_demanda", "Metodo", col]].copy()
         return out.rename(columns={col: "Pronostico"})
 
+    # --- Métodos mensuales: SES, COMBINADO, SBA -> último mes por material ---
     unidos = pd.concat([
         _sel(ses, "Pronostico_SES"),
         _sel(combinado, "Pronostico_COMBINADO"),
         _sel(sba, "Pronostico_SBA"),
     ], ignore_index=True)
 
-    # Último mes por Material + Centro
     if not unidos.empty:
-        ultimo = (
+        mensual = (
             unidos.sort_values(["Material", "Centro", "FechaMes"])
             .groupby(["Material", "Centro"], as_index=False)
-            .tail(1)
-            .reset_index(drop=True)
+            .tail(1).reset_index(drop=True)
         )
     else:
-        ultimo = unidos
+        mensual = unidos
 
-    # Materiales sin demanda -> FechaMes nulo, Pronostico 0
-    sin_demanda = clasificacion[clasificacion["Tipo_demanda"] == "Sin demanda"].copy()
-    if not sin_demanda.empty:
-        sin_demanda["FechaMes"] = pd.NaT
-        sin_demanda["Pronostico"] = 0.0
-        sin_demanda = sin_demanda[["Material", "Centro", "FechaMes",
-                                   "Tipo_demanda", "Metodo", "Pronostico"]]
-        final = pd.concat([ultimo, sin_demanda], ignore_index=True)
+    # --- Método PR: el pronóstico es el tamaño esperado de la próxima demanda ---
+    if not pr_final.empty:
+        pr_base = pr_final[["Material", "Centro", "FechaMes",
+                            "Tipo_demanda", "Metodo", "Media_Tamano"]].copy()
+        pr_base = pr_base.rename(columns={"Media_Tamano": "Pronostico"})
     else:
-        final = ultimo
+        pr_base = pd.DataFrame(columns=["Material", "Centro", "FechaMes",
+                                        "Tipo_demanda", "Metodo", "Pronostico"])
 
-    # Pegar datos del proceso de renovación (por Material + Centro)
+    # --- Materiales sin demanda -> pronóstico 0 ---
+    sin_dem = clasificacion[clasificacion["Tipo_demanda"] == "Sin demanda"].copy()
+    if not sin_dem.empty:
+        sin_dem["FechaMes"] = pd.NaT
+        sin_dem["Pronostico"] = 0.0
+        sin_dem = sin_dem[["Material", "Centro", "FechaMes",
+                           "Tipo_demanda", "Metodo", "Pronostico"]]
+
+    final = pd.concat([mensual, pr_base, sin_dem], ignore_index=True)
+
+    # --- Pegar detalle del proceso de renovación (solo materiales PR) ---
     cols_pr = {
         "Media_Intervalo": "PR_Media_Intervalo",
         "Media_Tamano": "PR_Tamano_Esperado",
@@ -380,7 +401,7 @@ def resultado_final(
         for nuevo in cols_pr.values():
             final[nuevo] = np.nan
 
-    # Columnas calculadas
+    # --- Columnas calculadas ---
     final["MesPronosticado"] = final["FechaMes"].apply(
         lambda f: (f + pd.DateOffset(months=1)) if pd.notna(f) else pd.NaT
     )
@@ -390,5 +411,29 @@ def resultado_final(
     final["PR_Pronostico_redondeado"] = final["PR_Tamano_Esperado"].apply(
         lambda x: int(math.ceil(x)) if pd.notna(x) else pd.NA
     )
+
+    # --- Tiempo hasta la próxima demanda (unificado, según el método) ---
+    dias_prox_mes = _dias_hasta_proximo_mes()
+
+    def _tiempo(row):
+        """Devuelve (texto, dias) del tiempo hasta la próxima demanda."""
+        metodo = row["Metodo"]
+        if metodo in ("SES", "COMBINADO"):
+            # Constante y Errática: la próxima demanda es el próximo mes.
+            return f"{dias_prox_mes} días", dias_prox_mes
+        if metodo == "SBA":
+            # Pocas demandas históricas: no se puede estimar cuándo.
+            return "Indeterminado", pd.NA
+        if metodo == "PR":
+            periodos = row.get("PR_Periodos_Hasta_Prox")
+            if pd.isna(periodos):
+                return "Indeterminado", pd.NA
+            dias = int(round(periodos * config.DIAS_POR_MES))
+            return f"{dias} días", dias
+        return "Sin demanda", pd.NA
+
+    tiempos = final.apply(_tiempo, axis=1, result_type="expand")
+    final["Tiempo_hasta_demanda"] = tiempos[0]
+    final["Dias_hasta_demanda"] = tiempos[1]
 
     return final.sort_values(["Material", "Centro"]).reset_index(drop=True)
