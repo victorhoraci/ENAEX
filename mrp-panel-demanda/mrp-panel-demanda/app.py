@@ -120,13 +120,24 @@ def grafico_material(serie_mat: pd.DataFrame, info: pd.Series | None) -> go.Figu
             hovertemplate="%{x|%b %Y}<br>Stock: %{y:.0f}<extra></extra>",
         ))
     if info is not None and pd.notna(info.get("MesPronosticado")):
-        fig.add_trace(go.Scatter(
-            x=[info["MesPronosticado"]], y=[info["Pronostico"]],
-            name="Pronóstico próximo período", mode="markers",
-            marker=dict(color="#F39C12", size=14, symbol="star",
-                        line=dict(color="#B9770E", width=1)),
-            hovertemplate="%{x|%b %Y}<br>Pronóstico: %{y:.1f}<extra></extra>",
-        ))
+        indet = str(info.get("Tiempo_hasta_demanda", "")) == "Indeterminado"
+        if indet:
+            # Demanda intermitente con pocos datos: no se sabe cuándo -> se marca con *
+            fig.add_trace(go.Scatter(
+                x=[info["MesPronosticado"]], y=[info["Pronostico"]],
+                name="Pronóstico (fecha indeterminada) *", mode="markers",
+                marker=dict(color="#8E44AD", size=16, symbol="asterisk",
+                            line=dict(color="#8E44AD", width=2)),
+                hovertemplate="Pronóstico: %{y:.1f}<br>(momento indeterminado)<extra></extra>",
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=[info["MesPronosticado"]], y=[info["Pronostico"]],
+                name="Pronóstico próxima demanda ★", mode="markers",
+                marker=dict(color="#F39C12", size=14, symbol="star",
+                            line=dict(color="#B9770E", width=1)),
+                hovertemplate="%{x|%b %Y}<br>Pronóstico: %{y:.1f}<extra></extra>",
+            ))
     fig.update_layout(
         barmode="group", height=460, margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
@@ -270,16 +281,40 @@ def render_agregar_datos():
         "**MB5B** del mes recién cerrado. El **MB51** conviene actualizarlo cada semana."
     )
 
-    # Estado actual de MB5B (qué meses hay cargados)
-    estado = data_loading.estado_mb5b()
-    if estado["meses"]:
-        meses_txt = ", ".join(m.strftime("%b %Y") for m in estado["meses"])
-        st.info(f"Meses de MB5B cargados ({estado['n_archivos']}): {meses_txt}")
-    if estado["falta"] and estado["mes_faltante"] is not None:
-        st.error(
-            f"Parece que falta cargar el **MB5B de "
-            f"{estado['mes_faltante']:%B %Y}**. Súbelo abajo."
+    # ---- Instrucciones de descarga desde SAP HANA ----
+    with st.expander("📥 Cómo descargar los Excel desde SAP HANA (layouts)"):
+        st.markdown(
+            """
+**MB51 — movimientos**
+1. Entra a la transacción **MB51**.
+2. Aplica el layout **`/CALCDEMANDA`** — *"MOV. PARA PRONOSTICO DE DEMANDA"*.
+   (Es el layout que deja las columnas correctas para el pronóstico.)
+3. Exporta a Excel. Ese archivo es el que subes en **"1) MB51"**.
+
+**MB5B — stock del mes**
+1. Entra a la transacción **MB5B**.
+2. Usa un layout que deje **exactamente estas columnas** (en este orden):
+
+   `Material · Descripción del material · De fecha · A fecha · Stock inicial ·
+   Total ctd.entrada mcía. · Total cantidades salida · Stock de cierre ·
+   Unidad medida base · Stock especial`
+3. Exporta a Excel (uno por mes) y súbelo en **"2) MB5B"**.
+            """
         )
+
+    # Estado actual de MB5B (protegido: si algo falla, no rompe el resto)
+    try:
+        estado = data_loading.estado_mb5b()
+        if estado["meses"]:
+            meses_txt = ", ".join(m.strftime("%b %Y") for m in estado["meses"])
+            st.info(f"Meses de MB5B cargados ({estado['n_archivos']}): {meses_txt}")
+        if estado["falta"] and estado["mes_faltante"] is not None:
+            st.error(
+                f"Parece que falta cargar el **MB5B de "
+                f"{estado['mes_faltante']:%B %Y}**. Súbelo abajo."
+            )
+    except Exception as e:
+        st.caption(f"(No se pudo revisar el estado de MB5B: {e})")
 
     col1, col2 = st.columns(2)
 
@@ -290,10 +325,13 @@ def render_agregar_datos():
         mb51_file = st.file_uploader("Sube el Excel de MB51", type=["xlsx", "xls"],
                                      key="up_mb51")
         if mb51_file is not None and st.button("Reemplazar MB51", type="primary"):
-            nombre = data_loading.reemplazar_mb51(mb51_file)
-            st.cache_data.clear()
-            st.success(f"MB51 actualizado: {nombre}. El panel se recalculará.")
-            st.rerun()
+            try:
+                nombre = data_loading.reemplazar_mb51(mb51_file)
+                st.cache_data.clear()
+                st.success(f"MB51 actualizado: {nombre}. El panel se recalculará.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo guardar el MB51: {e}")
 
     # ---- MB5B: agrega ----
     with col2:
@@ -302,10 +340,13 @@ def render_agregar_datos():
         mb5b_file = st.file_uploader("Sube el Excel de MB5B del mes", type=["xlsx", "xls"],
                                      key="up_mb5b")
         if mb5b_file is not None and st.button("Agregar MB5B"):
-            nombre = data_loading.agregar_mb5b(mb5b_file)
-            st.cache_data.clear()
-            st.success(f"MB5B agregado: {nombre}. El panel se recalculará.")
-            st.rerun()
+            try:
+                nombre = data_loading.agregar_mb5b(mb5b_file)
+                st.cache_data.clear()
+                st.success(f"MB5B agregado: {nombre}. El panel se recalculará.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo guardar el MB5B: {e}")
 
     st.markdown("---")
     st.caption(
@@ -365,8 +406,13 @@ ADI mide cada cuánto hay demanda y CV² cuánto varía su tamaño.
 
 Ve a la pestaña **➕ Agregar datos**:
 
-- **MB51** (movimientos): se descarga de SAP **cada semana** y **reemplaza** al anterior.
-- **MB5B** (stock del mes): se agrega **uno nuevo cada mes** (no se borran los anteriores).
+- **MB51** (movimientos): en SAP usa la transacción **MB51** con el layout
+  **`/CALCDEMANDA`** ("MOV. PARA PRONOSTICO DE DEMANDA"), exporta a Excel y
+  súbelo. Se descarga **cada semana** y **reemplaza** al anterior.
+- **MB5B** (stock del mes): en SAP usa la transacción **MB5B** con un layout que
+  deje estas columnas — Material, Descripción del material, De fecha, A fecha,
+  Stock inicial, Total ctd.entrada mcía., Total cantidades salida, Stock de
+  cierre, Unidad medida base, Stock especial. Se agrega **uno nuevo cada mes**.
 
 Al subir un archivo, el panel recalcula todo automáticamente.
 
@@ -389,9 +435,15 @@ def main():
         ["📊  Panel", "➕  Agregar datos", "📖  Cómo usar"]
     )
     with tab_panel:
-        render_panel()
+        try:
+            render_panel()
+        except Exception as e:
+            st.error(f"Ocurrió un problema al mostrar el panel: {e}")
     with tab_datos:
-        render_agregar_datos()
+        try:
+            render_agregar_datos()
+        except Exception as e:
+            st.error(f"Ocurrió un problema en 'Agregar datos': {e}")
     with tab_ayuda:
         render_ayuda()
 

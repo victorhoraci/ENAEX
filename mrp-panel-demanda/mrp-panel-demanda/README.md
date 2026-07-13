@@ -103,6 +103,15 @@ Tienes dos formas de actualizar:
 - **Desde las carpetas**: deja los Excel directamente en `data/MB51/` y
   `data/MB5B/` (por ejemplo subiéndolos a GitHub) y refresca el panel.
 
+**Cómo descargarlos desde SAP HANA (layouts):**
+
+- **MB51:** transacción **MB51** con el layout **`/CALCDEMANDA`** —
+  *"MOV. PARA PRONOSTICO DE DEMANDA"*. Exporta a Excel.
+- **MB5B:** transacción **MB5B** con un layout que deje estas columnas, en este
+  orden: Material · Descripción del material · De fecha · A fecha · Stock inicial ·
+  Total ctd.entrada mcía. · Total cantidades salida · Stock de cierre ·
+  Unidad medida base · Stock especial.
+
 El panel reconoce las columnas por su nombre y tolera variantes comunes de los
 encabezados de SAP. Si falta una columna clave, avisa cuál no encontró.
 
