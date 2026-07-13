@@ -251,6 +251,27 @@ def agregar_mb5b(archivo, carpeta: str | Path | None = None) -> str:
     return destino.name
 
 
+def archivos_detectados() -> dict:
+    """
+    Diagnóstico: muestra la ruta real y los archivos Excel que la app ve en
+    este momento en las carpetas MB51 y MB5B (lectura en vivo, sin caché).
+    Sirve para verificar si está leyendo los datos reales o aún los de ejemplo.
+    """
+    def _ls(p):
+        p = Path(p)
+        if not p.exists():
+            return str(p), ["(la carpeta no existe)"]
+        nombres = [f.name for f in _listar_excels(p)]
+        return str(p), (nombres if nombres else ["(vacía)"])
+
+    ruta51, arch51 = _ls(config.CARPETA_MB51)
+    ruta5b, arch5b = _ls(config.CARPETA_MB5B)
+    return {
+        "mb51_ruta": ruta51, "mb51_archivos": arch51,
+        "mb5b_ruta": ruta5b, "mb5b_archivos": arch5b,
+    }
+
+
 def estado_mb5b(carpeta: str | Path | None = None) -> dict:
     """
     Revisa qué meses de MB5B hay cargados y si falta el del mes recién cerrado.

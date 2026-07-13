@@ -13,11 +13,13 @@ Ejecutar con:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from mrp import config, data_loading
+from mrp import config, data_loading, github_store
 from mrp.pipeline import construir
 
 # --------------------------------------------------------------------------
@@ -153,6 +155,20 @@ def grafico_material(serie_mat: pd.DataFrame, info: pd.Series | None) -> go.Figu
 # PESTAÑA 1 — PANEL
 # --------------------------------------------------------------------------
 def render_panel():
+    # --- Diagnóstico: qué archivos ve la app en las carpetas (lectura en vivo) ---
+    with st.expander("🔍 Ver qué archivos está leyendo la app (diagnóstico)"):
+        diag = data_loading.archivos_detectados()
+        st.markdown(f"**Carpeta MB51:** `{diag['mb51_ruta']}`")
+        st.write(diag["mb51_archivos"])
+        st.markdown(f"**Carpeta MB5B:** `{diag['mb5b_ruta']}`")
+        st.write(diag["mb5b_archivos"])
+        st.caption(
+            "Si aquí ves tus archivos reales pero el panel muestra otros datos, "
+            "es la caché: pulsa **🔄 Recargar datos** (barra lateral) o reinicia "
+            "la app (Manage app → Reboot). Si ves archivos de ejemplo, bórralos "
+            "del repositorio."
+        )
+
     try:
         serie, clasif, resultado, tabla = cargar()
     except FileNotFoundError:
@@ -175,6 +191,19 @@ def render_panel():
         st.markdown("---")
         st.caption(f"Datos hasta: **{serie['FechaMes'].max():%b %Y}**")
         st.caption(f"Materiales: **{tabla['Material'].nunique()}**")
+        if st.button("🔄 Recargar datos"):
+            st.cache_data.clear()
+            st.rerun()
+
+        # Imagen explicativa de los tipos de demanda (clic para ampliar)
+        st.markdown("---")
+        with st.expander("❓ ¿Qué significan los tipos de demanda?"):
+            img = Path(__file__).parent / "assets" / "Tipos_de_demanda.png"
+            if img.exists():
+                st.image(str(img), use_container_width=True,
+                         caption="Pasa el cursor y usa el ícono ⛶ para ampliar.")
+            else:
+                st.caption("(No se encontró la imagen Tipos_de_demanda.png en assets/.)")
 
     tabla_f = tabla[
         tabla["Centro"].isin(centro_sel) & tabla["Tipo_demanda"].isin(tipo_sel)
@@ -288,7 +317,6 @@ def render_agregar_datos():
 **MB51 — movimientos**
 1. Entra a la transacción **MB51**.
 2. Aplica el layout **`/CALCDEMANDA`** — *"MOV. PARA PRONOSTICO DE DEMANDA"*.
-   (Es el layout que deja las columnas correctas para el pronóstico.)
 3. Exporta a Excel. Ese archivo es el que subes en **"1) MB51"**.
 
 **MB5B — stock del mes**
@@ -302,23 +330,58 @@ def render_agregar_datos():
             """
         )
 
-    # Estado actual de MB5B (protegido: si algo falla, no rompe el resto)
+    # ---- Dónde se guardarán los archivos ----
+    modo_github = github_store.disponible()
+    if modo_github:
+        st.success("🟢 Los archivos se guardarán **directamente en el repositorio de GitHub** "
+                   "(quedan permanentes). La app se actualizará sola en ~1 minuto.")
+    else:
+        st.info("🟡 Guardado **local**: en la nube estos archivos son temporales. "
+                "Para guardarlos en GitHub automáticamente, configura los *secrets* "
+                "(ver README, sección 'Guardar en GitHub desde la app').")
+
+    # ---- Contraseña ----
+    autorizado = True
+    if github_store.password_configurada():
+        clave = st.text_input("🔒 Contraseña para agregar datos", type="password")
+        autorizado = github_store.password_ok(clave)
+        if not autorizado:
+            st.caption("Ingresa la contraseña para habilitar la carga de archivos.")
+    else:
+        st.caption("⚠️ No hay contraseña configurada. Se recomienda agregar "
+                   "`APP_PASSWORD` en los *secrets* (ver README).")
+
+    # Estado actual de MB5B (protegido)
     try:
         estado = data_loading.estado_mb5b()
         if estado["meses"]:
             meses_txt = ", ".join(m.strftime("%b %Y") for m in estado["meses"])
             st.info(f"Meses de MB5B cargados ({estado['n_archivos']}): {meses_txt}")
         if estado["falta"] and estado["mes_faltante"] is not None:
-            st.error(
-                f"Parece que falta cargar el **MB5B de "
-                f"{estado['mes_faltante']:%B %Y}**. Súbelo abajo."
-            )
+            st.error(f"Parece que falta cargar el **MB5B de "
+                     f"{estado['mes_faltante']:%B %Y}**. Súbelo abajo.")
     except Exception as e:
         st.caption(f"(No se pudo revisar el estado de MB5B: {e})")
 
-    col1, col2 = st.columns(2)
+    if not autorizado:
+        return
 
-    # ---- MB51: reemplaza ----
+    def _guardar(archivo, es_mb51: bool):
+        contenido = archivo.getvalue()
+        if modo_github:
+            if es_mb51:
+                github_store.guardar_mb51(archivo.name, contenido)
+            else:
+                github_store.agregar_mb5b(archivo.name, contenido)
+            return "en GitHub (la app se actualizará sola en ~1 min)"
+        else:
+            if es_mb51:
+                data_loading.reemplazar_mb51(archivo)
+            else:
+                data_loading.agregar_mb5b(archivo)
+            return "localmente"
+
+    col1, col2 = st.columns(2)
     with col1:
         st.markdown("##### 1) MB51 — movimientos (semanal)")
         st.caption("Al subirlo, **reemplaza** el MB51 anterior.")
@@ -326,14 +389,14 @@ def render_agregar_datos():
                                      key="up_mb51")
         if mb51_file is not None and st.button("Reemplazar MB51", type="primary"):
             try:
-                nombre = data_loading.reemplazar_mb51(mb51_file)
+                donde = _guardar(mb51_file, es_mb51=True)
                 st.cache_data.clear()
-                st.success(f"MB51 actualizado: {nombre}. El panel se recalculará.")
-                st.rerun()
+                st.success(f"MB51 guardado {donde}: {mb51_file.name}")
+                if not modo_github:
+                    st.rerun()
             except Exception as e:
                 st.error(f"No se pudo guardar el MB51: {e}")
 
-    # ---- MB5B: agrega ----
     with col2:
         st.markdown("##### 2) MB5B — stock del mes (mensual)")
         st.caption("Al subirlo, **se agrega** a los meses anteriores.")
@@ -341,10 +404,11 @@ def render_agregar_datos():
                                      key="up_mb5b")
         if mb5b_file is not None and st.button("Agregar MB5B"):
             try:
-                nombre = data_loading.agregar_mb5b(mb5b_file)
+                donde = _guardar(mb5b_file, es_mb51=False)
                 st.cache_data.clear()
-                st.success(f"MB5B agregado: {nombre}. El panel se recalculará.")
-                st.rerun()
+                st.success(f"MB5B guardado {donde}: {mb5b_file.name}")
+                if not modo_github:
+                    st.rerun()
             except Exception as e:
                 st.error(f"No se pudo guardar el MB5B: {e}")
 

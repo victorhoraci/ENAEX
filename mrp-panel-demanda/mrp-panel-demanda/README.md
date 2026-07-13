@@ -117,6 +117,44 @@ encabezados de SAP. Si falta una columna clave, avisa cuál no encontró.
 
 ---
 
+## 🔐 Guardar en GitHub desde la app (con contraseña)
+
+Por defecto, los archivos que subes en la pestaña **➕ Agregar datos** se guardan
+solo temporalmente en la nube. Puedes activar que se **guarden directamente en el
+repositorio de GitHub** (permanentes) y que **pidan una contraseña**. Se
+configura una sola vez con los *secrets* de Streamlit.
+
+**1) Crea un token de GitHub (permite a la app escribir en el repo):**
+1. En GitHub: foto de perfil → **Settings** → abajo **Developer settings**.
+2. **Personal access tokens → Fine-grained tokens → Generate new token**.
+3. Nombre y expiración a gusto. En **Repository access** elige *Only select
+   repositories* → tu repo `ENAEX`.
+4. En **Permissions → Repository permissions → Contents**, selecciona
+   **Read and write**.
+5. Genera el token y **cópialo** (empieza con `github_pat_...`). Solo se muestra una vez.
+
+**2) Configura los *secrets* en Streamlit Cloud:**
+1. Abre tu app en share.streamlit.io → menú **⋮** o **Settings → Secrets**.
+2. Pega esto (reemplazando con tus valores) y guarda:
+
+   ```toml
+   APP_PASSWORD       = "una-clave-secreta"
+   GITHUB_TOKEN       = "github_pat_xxxxxxxx"
+   GITHUB_REPO        = "victorhoraci/ENAEX"
+   GITHUB_BRANCH      = "main"
+   GITHUB_DATA_PREFIX = "mrp-panel-demanda/mrp-panel-demanda/data"
+   ```
+
+Al guardar, la app se reinicia. Desde entonces, en **➕ Agregar datos** te pedirá
+la contraseña y, al subir un Excel, lo dejará guardado en el repo (MB51 reemplaza,
+MB5B se agrega). La app vuelve a leer los datos sola en ~1 minuto.
+
+> El archivo `secrets.toml` **nunca** se sube al repo (está en `.gitignore`).
+> Para probar localmente, copia `.streamlit/secrets.toml.example` como
+> `.streamlit/secrets.toml` y complétalo.
+
+---
+
 ## 🧮 Cómo se calcula el pronóstico
 
 1. **Demanda mensual** — se suman los consumos (clases 201/261) por material y mes.
