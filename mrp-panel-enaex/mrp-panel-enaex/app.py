@@ -1685,6 +1685,7 @@ API = "https://api.github.com"
 def _secret(clave: str, defecto=None):
     """Lee un secret de Streamlit sin reventar si no está configurado."""
     try:
+        import streamlit as st
         if clave in st.secrets:
             return st.secrets[clave]
     except Exception:
@@ -1739,6 +1740,7 @@ def _headers(token: str) -> dict:
 
 def _listar_dir(cfg: dict, carpeta: str) -> list[dict]:
     """Lista los archivos de una carpeta del repo (name, path, sha)."""
+    import requests
     url = f"{API}/repos/{cfg['repo']}/contents/{carpeta}"
     r = requests.get(url, headers=_headers(cfg["token"]),
                      params={"ref": cfg["branch"]}, timeout=30)
@@ -1749,6 +1751,7 @@ def _listar_dir(cfg: dict, carpeta: str) -> list[dict]:
 
 def _sha_de(cfg: dict, ruta: str) -> str | None:
     """Devuelve el sha del archivo si ya existe (necesario para actualizarlo)."""
+    import requests
     url = f"{API}/repos/{cfg['repo']}/contents/{ruta}"
     r = requests.get(url, headers=_headers(cfg["token"]),
                      params={"ref": cfg["branch"]}, timeout=30)
@@ -1759,6 +1762,7 @@ def _sha_de(cfg: dict, ruta: str) -> str | None:
 
 def _put(cfg: dict, ruta: str, contenido: bytes, mensaje: str):
     """Crea o actualiza un archivo en el repo."""
+    import requests
     url = f"{API}/repos/{cfg['repo']}/contents/{ruta}"
     data = {
         "message": mensaje,
@@ -1774,6 +1778,7 @@ def _put(cfg: dict, ruta: str, contenido: bytes, mensaje: str):
 
 def _delete(cfg: dict, ruta: str, sha: str, mensaje: str):
     """Borra un archivo del repo."""
+    import requests
     url = f"{API}/repos/{cfg['repo']}/contents/{ruta}"
     data = {"message": mensaje, "sha": sha, "branch": cfg["branch"]}
     r = requests.delete(url, headers=_headers(cfg["token"]), json=data, timeout=120)
@@ -2094,7 +2099,8 @@ def pagina_demanda():
         with st.expander("❓ ¿Qué significan los tipos de demanda?"):
             img = RAIZ_PROYECTO / "assets" / "Tipos_de_demanda.png"
             if img.exists():
-                st.image(str(img), use_container_width=True)
+                # sin parámetros de ancho: compatible con todas las versiones
+                st.image(str(img))
             else:
                 st.caption(
                     "**Constante:** demanda frecuente y estable → SES.\n\n"
@@ -2642,21 +2648,34 @@ repositorio.
 # ==========================================================================
 #  NAVEGACIÓN
 # ==========================================================================
+# Se usa un menú con `st.radio` en la barra lateral en vez de `st.navigation`
+# porque funciona en CUALQUIER versión de Streamlit (st.navigation exige 1.36+
+# y hacía fallar la app con el error genérico "Oh, no").
+
+PAGINAS = {
+    "🏠  Inicio": pagina_inicio,
+    "📈  Demanda y Pronóstico": pagina_demanda,
+    "🚚  MRP E002": pagina_mrp_e002,
+    "📥  Cargar archivos": pagina_cargar,
+    "📖  Cómo usar": pagina_ayuda,
+}
+
+
 def main():
-    paginas = {
-        "Inicio": [
-            st.Page(pagina_inicio, title="Inicio", icon="🏠", default=True),
-        ],
-        "01 Visualizaciones": [
-            st.Page(pagina_demanda, title="Demanda y Pronóstico", icon="📈"),
-            st.Page(pagina_mrp_e002, title="MRP E002", icon="🚚"),
-        ],
-        "02 Datos": [
-            st.Page(pagina_cargar, title="Cargar archivos", icon="📥"),
-            st.Page(pagina_ayuda, title="Cómo usar", icon="📖"),
-        ],
-    }
-    st.navigation(paginas).run()
+    with st.sidebar:
+        st.markdown("### 📦 Panel MRP · Enaex")
+        eleccion = st.radio(
+            "Ir a:", list(PAGINAS.keys()), label_visibility="collapsed"
+        )
+        st.markdown("---")
+
+    try:
+        PAGINAS[eleccion]()
+    except Exception as e:
+        st.error(f"Ocurrió un problema en esta página: {e}")
+        st.caption("Revisa que los Excel estén cargados en la página "
+                   "**📥 Cargar archivos**. Si el error persiste, avísanos "
+                   "con este mensaje.")
 
 
 if __name__ == "__main__":
