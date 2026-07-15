@@ -22,6 +22,18 @@ RAIZ_PROYECTO = Path(__file__).resolve().parent.parent
 CARPETA_MB51 = RAIZ_PROYECTO / "data" / "MB51"
 CARPETA_MB5B = RAIZ_PROYECTO / "data" / "MB5B"
 
+# --- Panel 2: Abastecimiento (estado de materiales) ---
+# MRP  -> planificación semanal (Planificacion_Simpl, hoja 'data')
+# MM60 -> maestro de materiales (precio, ABC, grupo de compras)
+# ME5A -> solicitudes de pedido (solped)
+# ME2M -> órdenes de compra (OC) en tránsito
+# TAT  -> estudio de tiempos de abastecimiento (MERGE, hoja resumen por material)
+CARPETA_MRP = RAIZ_PROYECTO / "data" / "MRP"
+CARPETA_MM60 = RAIZ_PROYECTO / "data" / "MM60"
+CARPETA_ME5A = RAIZ_PROYECTO / "data" / "ME5A"
+CARPETA_ME2M = RAIZ_PROYECTO / "data" / "ME2M"
+CARPETA_TAT = RAIZ_PROYECTO / "data" / "TAT"
+
 
 # --------------------------------------------------------------------------
 # PARÁMETROS DEL MODELO DE DEMANDA

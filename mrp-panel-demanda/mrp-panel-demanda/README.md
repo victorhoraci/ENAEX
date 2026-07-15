@@ -155,6 +155,69 @@ MB5B se agrega). La app vuelve a leer los datos sola en ~1 minuto.
 
 ---
 
+## 🚚 Panel 2 · Abastecimiento (seguimiento y control)
+
+Segundo panel (menú lateral → **Abastecimiento**) para hacer seguimiento y tomar
+decisiones sobre los materiales: qué está en validación o con solped bloqueada,
+cuántos días llevan las solped y las OC, qué OC están atrasadas, si son
+nacionales o internacionales, y si el stock alcanza para la próxima demanda.
+
+### Qué archivos subir (y cada cuánto)
+
+| Archivo | De dónde sale | Cada cuánto | Carpeta |
+|---|---|---|---|
+| **MRP semanal** | `Planificacion_Simpl…xlsx`, hoja `data` (encabezados en la fila 16) | Semanal | `data/MRP` |
+| **MM60** | Transacción MM60 (maestro: precio, ABC, grupo compra) | Mensual | `data/MM60` |
+| **ME5A** | Transacción ME5A (solicitudes / solped) | Semanal | `data/ME5A` |
+| **ME2M** | Transacción ME2M (órdenes de compra) | Semanal | `data/ME2M` |
+| **TAT** | `…VISTA_EJECUTIVA_MATERIALES_….xlsx`, hoja **`Dias_TAT`** | Mensual | `data/TAT` |
+
+Todos se pueden subir desde la pestaña **➕ Actualizar datos** del panel (con
+contraseña y guardado en GitHub). Cada uno **reemplaza** al anterior.
+
+> El TAT se lee de la hoja **`Dias_TAT`** de la *Vista Ejecutiva de Materiales*
+> (una fila por material: media, mínimo, máximo, desviación, variabilidad,
+> recurrencia y días desde la última solicitud). Si se sube el archivo MERGE
+> antiguo, el panel también lo entiende (compatibilidad hacia atrás).
+
+### Cómo se unen las tablas (llaves)
+
+| Fuente | Se une por |
+|---|---|
+| MRP semanal | tabla **base** (nadie se pierde) |
+| MM60 | Material + Centro |
+| ME5A | Solped + Material |
+| ME2M | OC + Material |
+| TAT | Material (todos los centros, sin centro) |
+| Demanda (panel 1) | Material |
+
+### 🔑 Ningún material se pierde
+
+Todas las uniones son *left join* sobre el MRP: un material sin solped, sin OC,
+sin TAT o sin pronóstico **igual aparece**, con esos campos en blanco. Además,
+la pestaña **Gestión** separa en tablas propias los materiales en *validación* y
+con *solped bloqueada*, para que no desaparezcan al mostrar los días de gestión
+(el problema que ocurría en Power BI). La pestaña **Todos los materiales** siempre
+muestra el total.
+
+### Medidas replicadas del DAX
+
+| Medida (Power BI) | En el panel |
+|---|---|
+| `Observación` (Con OC / Con Solped / Solped bloqueada / Validación) | **Estado gestión** |
+| `Estado OC` (Atrasada / En curso) | **Estado OC** |
+| `Días desde Solped`, `1Días Duración OC` | **Días en solped**, **Días de OC** |
+| `Dias hasta llegada material` | **Días hasta llegada** |
+| `Rango Días Solicitud`, `Rango Días Atraso Material` | **Rango días solped**, **Rango atraso OC** |
+| `Nacionalidad OC` (45→Nacional, 47→Internacional) | **Nacionalidad** |
+| `Disponibilidad Conservadora` | **Disponible conservador** |
+| `Criticidad Texto` (A→Alta, C→Baja, resto→Media) | **Criticidad texto** |
+| `Rango TAT` | **Rango TAT** |
+| `Pronostico_Consolidado`, `Tiempo_Prox_Demanda`, `Cumple_Demanda` | mismas columnas |
+| `Valor Stock Total`, `1Precio en Tránsito` | **Valor stock**, **Costo en tránsito** |
+
+---
+
 ## 🧮 Cómo se calcula el pronóstico
 
 1. **Demanda mensual** — se suman los consumos (clases 201/261) por material y mes.

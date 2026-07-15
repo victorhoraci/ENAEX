@@ -251,6 +251,20 @@ def agregar_mb5b(archivo, carpeta: str | Path | None = None) -> str:
     return destino.name
 
 
+def guardar_local(carpeta, archivo, reemplazar: bool = True) -> str:
+    """Guardado genérico en una carpeta local (reemplaza o agrega)."""
+    carpeta = Path(carpeta)
+    carpeta.mkdir(parents=True, exist_ok=True)
+    if reemplazar:
+        for viejo in carpeta.iterdir():
+            if viejo.suffix.lower() in (".xlsx", ".xls"):
+                viejo.unlink()
+    destino = carpeta / getattr(archivo, "name", "archivo.xlsx")
+    with open(destino, "wb") as f:
+        f.write(archivo.getvalue() if hasattr(archivo, "getvalue") else archivo.read())
+    return destino.name
+
+
 def archivos_detectados() -> dict:
     """
     Diagnóstico: muestra la ruta real y los archivos Excel que la app ve en

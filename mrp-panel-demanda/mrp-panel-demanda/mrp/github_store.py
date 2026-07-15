@@ -136,6 +136,24 @@ def _delete(cfg: dict, ruta: str, sha: str, mensaje: str):
 # --------------------------------------------------------------------------
 # Operaciones de alto nivel (usadas por el panel)
 # --------------------------------------------------------------------------
+def guardar(subcarpeta: str, nombre: str, contenido: bytes, reemplazar: bool = True) -> str:
+    """
+    Guardado genérico en cualquier subcarpeta de datos del repo.
+    reemplazar=True borra los Excel previos de esa subcarpeta (snapshots que se
+    reemplazan, como MRP/MM60/ME5A/ME2M/TAT). reemplazar=False solo agrega.
+    """
+    cfg = _config()
+    if cfg is None:
+        raise RuntimeError("GitHub no está configurado (falta GITHUB_TOKEN o GITHUB_REPO).")
+    carpeta = f"{cfg['prefix']}/{subcarpeta}"
+    if reemplazar:
+        for item in _listar_dir(cfg, carpeta):
+            if item["name"].lower().endswith((".xlsx", ".xls")):
+                _delete(cfg, item["path"], item["sha"], f"Reemplazar {subcarpeta}: borrar {item['name']}")
+    _put(cfg, f"{carpeta}/{nombre}", contenido, f"Actualizar {subcarpeta}: {nombre}")
+    return nombre
+
+
 def guardar_mb51(nombre: str, contenido: bytes) -> str:
     """
     MB51 REEMPLAZA: borra los Excel que haya en la carpeta MB51 del repo y
