@@ -1492,6 +1492,30 @@ def _cumple_demanda(stock, demanda, stock_seg):
     return "Cumple"
 
 
+def _resultado_demanda(stock, demanda, stock_seg):
+    """
+    Qué pasa con el stock DESPUÉS de atender la próxima demanda.
+
+    - "No cumple"            -> el stock no alcanza para la demanda (falta material).
+    - "Consume todo el stock"-> queda en cero: hay que reponer sí o sí.
+    - "Queda en bajo stock"  -> alcanza, pero queda por debajo del stock de seguridad.
+    - "Cumple"               -> alcanza y conserva el stock de seguridad.
+    """
+    if pd.isna(demanda):
+        return "Sin pronóstico"
+    if pd.isna(stock):
+        return "Sin dato de stock"
+    seg = 0 if pd.isna(stock_seg) else stock_seg
+    restante = stock - demanda
+    if restante < 0:
+        return "No cumple"
+    if restante == 0:
+        return "Consume todo el stock"
+    if restante < seg:
+        return "Queda en bajo stock"
+    return "Cumple"
+
+
 def _estado_gestion(row) -> str:
     """Estado de gestión del material, según solped/OC y la observación."""
     obs = str(row.get("Observación") or "").lower()
@@ -1643,6 +1667,8 @@ def _unir_demanda(base: pd.DataFrame) -> pd.DataFrame:
         base["Pronostico_Consolidado"] = pd.NA
         base["Tiempo_Prox_Demanda"] = pd.NA
         base["Cumple_Demanda"] = "Sin pronóstico"
+        base["Stock tras demanda"] = pd.NA
+        base["Resultado demanda"] = "Sin pronóstico"
         return base
 
     # Pronóstico consolidado según el tipo de demanda
@@ -1668,6 +1694,13 @@ def _unir_demanda(base: pd.DataFrame) -> pd.DataFrame:
         seg = base["Stock Seguridad"] if "Stock Seguridad" in base.columns else pd.Series(0, index=base.index)
         base["Cumple_Demanda"] = [
             _cumple_demanda(s, d, sg)
+            for s, d, sg in zip(base["Stock"], base["Pronostico_Consolidado"], seg)
+        ]
+        # Qué queda de stock después de atender la próxima demanda
+        base["Stock tras demanda"] = pd.to_numeric(base["Stock"], errors="coerce") - \
+            pd.to_numeric(base["Pronostico_Consolidado"], errors="coerce")
+        base["Resultado demanda"] = [
+            _resultado_demanda(s, d, sg)
             for s, d, sg in zip(base["Stock"], base["Pronostico_Consolidado"], seg)
         ]
     return base
@@ -1907,6 +1940,22 @@ def cargar_abastecimiento():
 def _card(lbl, val, sub=""):
     return (f'<div class="metric-card"><div class="lbl">{lbl}</div>'
             f'<div class="val">{val}</div><div class="sub">{sub}</div></div>')
+
+
+def ficha_material(info):
+    """
+    Convierte la fila de un material en una tabla de dos columnas (Campo / Valor).
+
+    Se pasa todo a texto a propósito: la fila mezcla números, fechas y textos en
+    una sola columna y eso hacía fallar la conversión a Arrow que usa Streamlit
+    ("Expected bytes, got a 'numpy.float64' object").
+    """
+    serie = info.drop(labels=["etiqueta"], errors="ignore")
+    df = pd.DataFrame({
+        "Campo": [str(i) for i in serie.index],
+        "Valor": ["" if pd.isna(v) else str(v) for v in serie.values],
+    })
+    return df
 
 
 def _chip_demanda(tipo):
@@ -2153,8 +2202,7 @@ def pagina_demanda():
     st.plotly_chart(grafico_material(serie_mat, info), use_container_width=True)
 
     with st.expander("Ver todos los datos de este material"):
-        st.dataframe(info.drop(labels=["etiqueta"], errors="ignore")
-                     .rename("Valor").to_frame(), use_container_width=True)
+        st.dataframe(ficha_material(info), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown("#### Tabla de materiales (según filtros)")
@@ -2472,8 +2520,8 @@ def pagina_mrp_e002():
                              f"{info['Días desde última solicitud']:.0f} d atrás"
                              if pd.notna(info.get("Días desde última solicitud")) else "—")
             with st.expander("Ver todos los datos de este material"):
-                st.dataframe(info.drop(labels=["etiqueta"], errors="ignore")
-                             .rename("Valor").to_frame(), use_container_width=True)
+                st.dataframe(ficha_material(info), use_container_width=True,
+                             hide_index=True)
             st.markdown("---")
 
         vista = datos.drop(columns=["etiqueta"], errors="ignore").sort_values("Material")
@@ -2481,6 +2529,255 @@ def pagina_mrp_e002():
         st.download_button("⬇️  Descargar tabla completa (CSV)",
                            data=vista.to_csv(index=False).encode("utf-8-sig"),
                            file_name="mrp_e002_materiales.csv", mime="text/csv")
+
+
+# ==========================================================================
+#  PÁGINA · CONTROL DE MATERIALES (vista integrada)
+# ==========================================================================
+COLOR_RESULT = {
+    "Cumple": "#27AE60",
+    "Queda en bajo stock": "#F39C12",
+    "Consume todo el stock": "#E67E22",
+    "No cumple": "#E74C3C",
+    "Sin pronóstico": "#B0BEC5",
+    "Sin dato de stock": "#B0BEC5",
+}
+
+# Orden de las columnas tal como se pidió: primero el material y su stock,
+# después la demanda, luego la gestión (solped/OC), el TAT y el comentario.
+COLS_CONTROL = [
+    # 1) Material y stock
+    "Material", "Texto breve de material", "Centro", "Area", "Criticidad texto",
+    "Stock", "Stock Seguridad", "Condicion Stock",
+    # 2) Demanda
+    "Tipo_demanda", "Pronostico_Consolidado", "Tiempo_hasta_demanda_txt",
+    "Stock tras demanda", "Resultado demanda",
+    # 3) Gestión (solped / OC)
+    "Estado gestión", "Solped", "Días en solped", "OC en Transito",
+    "Días de OC", "Estado OC", "Días atraso OC", "Nacionalidad",
+    # 4) TAT
+    "TAT Promedio", "TAT Min", "TAT Max", "Recurrencia",
+    # 5) Comentario
+    "Observación",
+]
+
+RENOMBRE_CONTROL = {
+    "Texto breve de material": "Descripción",
+    "Criticidad texto": "Criticidad",
+    "Condicion Stock": "Estado del stock",
+    "Tipo_demanda": "Tipo de demanda",
+    "Pronostico_Consolidado": "Demanda proyectada",
+    "Tiempo_hasta_demanda_txt": "Tiempo hasta demanda",
+    "Stock tras demanda": "Stock tras la demanda",
+    "Resultado demanda": "¿Cumple la demanda?",
+    "Estado gestión": "Gestión",
+    "OC en Transito": "OC",
+    "Días de OC": "Días de gestión OC",
+    "Días en solped": "Días de gestión solped",
+    "TAT Promedio": "TAT prom. (días)",
+    "TAT Min": "TAT mín.",
+    "TAT Max": "TAT máx.",
+    "Observación": "Comentario",
+}
+
+
+def pagina_control():
+    st.markdown(
+        '<div class="hdr hdr-ambar"><h1>🎯 Control de Materiales</h1>'
+        '<p>Stock · demanda proyectada · cobertura · gestión de solped y OC · TAT</p></div>',
+        unsafe_allow_html=True,
+    )
+    try:
+        tabla, kpis = cargar_abastecimiento()
+    except FileNotFoundError:
+        st.error("Falta el **MRP semanal**, que es la base de esta vista.")
+        tabla_estado_archivos(expandido=True)
+        return
+    except Exception as e:
+        st.error(f"No se pudieron integrar los datos: {e}")
+        return
+
+    datos = tabla.copy()
+
+    # Tiempo hasta la demanda en texto legible (viene en meses)
+    def _tiempo_txt(x):
+        if pd.isna(x):
+            return "—"
+        dias = int(round(float(x) * DIAS_POR_MES))
+        return f"{dias} días"
+    datos["Tiempo_hasta_demanda_txt"] = datos["Tiempo_Prox_Demanda"].apply(_tiempo_txt) \
+        if "Tiempo_Prox_Demanda" in datos.columns else "—"
+
+    # ---------------- Filtros ----------------
+    with st.sidebar:
+        st.markdown("### Filtros")
+
+        def _multi(col, etiqueta):
+            if col not in datos.columns:
+                return None
+            ops = sorted(str(x) for x in datos[col].dropna().unique() if str(x).strip())
+            return st.multiselect(etiqueta, ops, default=ops, key=f"ctl_{col}")
+
+        f_centro = _multi("Centro", "Centro")
+        f_area = _multi("Area", "Área")
+        f_crit = _multi("Criticidad texto", "Criticidad")
+        f_cond = _multi("Condicion Stock", "Estado del stock")
+        f_res = _multi("Resultado demanda", "¿Cumple la demanda?")
+        f_gest = _multi("Estado gestión", "Gestión (solped / OC)")
+        if st.button("🔄 Recargar datos", key="rec_ctl"):
+            st.cache_data.clear()
+            st.rerun()
+
+    for col, sel in [("Centro", f_centro), ("Area", f_area), ("Criticidad texto", f_crit),
+                     ("Condicion Stock", f_cond), ("Resultado demanda", f_res),
+                     ("Estado gestión", f_gest)]:
+        if sel is not None and col in datos.columns:
+            datos = datos[datos[col].astype(str).isin(sel)]
+
+    if datos.empty:
+        st.warning("Ningún material coincide con los filtros.")
+        return
+
+    # ---------------- KPIs ----------------
+    k = st.columns(6)
+    k[0].metric("Materiales", f"{len(datos):,}".replace(",", "."))
+    k[1].metric("No cumplen la demanda",
+                int((datos["Resultado demanda"] == "No cumple").sum()))
+    k[2].metric("Consumen todo el stock",
+                int((datos["Resultado demanda"] == "Consume todo el stock").sum()))
+    k[3].metric("Quedan en bajo stock",
+                int((datos["Resultado demanda"] == "Queda en bajo stock").sum()))
+    k[4].metric("Solped bloqueadas",
+                int((datos["Estado gestión"] == "Solped bloqueada").sum()))
+    k[5].metric("En validación",
+                int((datos["Estado gestión"] == "Validación").sum()))
+
+    st.markdown("---")
+
+    # ---------------- Gráficos ----------------
+    g1, g2 = st.columns(2)
+    with g1:
+        orden = ["No cumple", "Consume todo el stock", "Queda en bajo stock",
+                 "Cumple", "Sin pronóstico"]
+        conteo = {o: int((datos["Resultado demanda"] == o).sum()) for o in orden}
+        conteo = {a: b for a, b in conteo.items() if b}
+        st.plotly_chart(barras(conteo, COLOR_RESULT,
+                               "¿Qué pasa con el stock tras la próxima demanda?"),
+                        use_container_width=True)
+    with g2:
+        orden = ["Sobre Stock", "Stock OK", "Bajo Stock", "Quiebre Stock"]
+        conteo = {o: int((datos["Condicion Stock"] == o).sum()) for o in orden}
+        conteo = {a: b for a, b in conteo.items() if b}
+        st.plotly_chart(barras(conteo, COLOR_COND, "Estado actual del stock"),
+                        use_container_width=True)
+
+    # ---------------- Materiales críticos ----------------
+    st.markdown("#### 🚨 Materiales que necesitan acción")
+    st.caption("No alcanzan a cubrir su próxima demanda, o quedan sin stock de "
+               "seguridad después de atenderla.")
+    criticos = datos[datos["Resultado demanda"].isin(
+        ["No cumple", "Consume todo el stock", "Queda en bajo stock"])]
+    if criticos.empty:
+        st.success("Todos los materiales con pronóstico cubren su próxima demanda.")
+    else:
+        cols = [c for c in COLS_CONTROL if c in criticos.columns]
+        vista_c = criticos[cols].rename(columns=RENOMBRE_CONTROL)
+        # Los más urgentes primero
+        orden_urg = {"No cumple": 0, "Consume todo el stock": 1, "Queda en bajo stock": 2}
+        vista_c = vista_c.assign(_o=criticos["Resultado demanda"].map(orden_urg).values) \
+                         .sort_values(["_o", "Descripción"]).drop(columns="_o")
+        st.dataframe(vista_c, use_container_width=True, hide_index=True)
+        st.download_button("⬇️  Descargar materiales críticos (CSV)",
+                           data=vista_c.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="materiales_criticos.csv", mime="text/csv",
+                           key="dl_crit")
+
+    st.markdown("---")
+
+    # ---------------- Ficha de un material ----------------
+    st.markdown("#### Ver un material en detalle")
+    datos["etiqueta"] = (datos["Material"].astype(str) + "  —  "
+                         + datos.get("Texto breve de material",
+                                     pd.Series("", index=datos.index)).fillna(""))
+    etiqueta = st.selectbox("Buscar material", ["(ninguno)"] + sorted(datos["etiqueta"]),
+                            key="ctl_buscar")
+    if etiqueta != "(ninguno)":
+        info = datos[datos["Material"] == etiqueta.split("  —  ")[0].strip()].iloc[0]
+        st.markdown(f"### {info.get('Texto breve de material', '')}")
+
+        c = st.columns(4)
+        c[0].metric("Stock actual", f"{info.get('Stock', '—')}")
+        c[1].metric("Stock de seguridad", f"{info.get('Stock Seguridad', '—')}")
+        c[2].metric("Estado del stock", str(info.get("Condicion Stock", "—")))
+        c[3].metric("Criticidad", str(info.get("Criticidad texto", "—")))
+
+        c = st.columns(4)
+        pron = info.get("Pronostico_Consolidado")
+        c[0].metric("Demanda proyectada", "—" if pd.isna(pron) else f"{pron:.0f}")
+        c[1].metric("Tiempo hasta demanda", str(info.get("Tiempo_hasta_demanda_txt", "—")))
+        std = info.get("Stock tras demanda")
+        c[2].metric("Stock tras la demanda", "—" if pd.isna(std) else f"{std:.0f}")
+        c[3].metric("¿Cumple?", str(info.get("Resultado demanda", "—")))
+
+        res = str(info.get("Resultado demanda", ""))
+        if res == "No cumple":
+            st.error("⚠️ El stock **no alcanza** para la próxima demanda. Hay que reponer.")
+        elif res == "Consume todo el stock":
+            st.warning("⚠️ La demanda **consume todo el stock**: queda en cero y hay que reponer.")
+        elif res == "Queda en bajo stock":
+            st.warning("Después de la demanda queda **por debajo del stock de seguridad**.")
+        elif res == "Cumple":
+            st.success("✅ El stock cubre la demanda y conserva el stock de seguridad.")
+
+        st.markdown("**Gestión (semana más actualizada del MRP)**")
+        c = st.columns(4)
+        with c[0]:
+            st.markdown(_chip_gestion(info["Estado gestión"]), unsafe_allow_html=True)
+        ds = info.get("Días en solped")
+        c[1].metric("Solped", "—" if pd.isna(info.get("Solped")) else str(info.get("Solped")),
+                    help="Solicitud de pedido asociada")
+        c[2].metric("Días de gestión solped", "—" if pd.isna(ds) else f"{int(ds)} días")
+        doc = info.get("Días de OC")
+        c[3].metric("OC", "—" if pd.isna(info.get("OC en Transito"))
+                    else str(info.get("OC en Transito")))
+        c = st.columns(4)
+        c[0].metric("Días de gestión OC", "—" if pd.isna(doc) else f"{int(doc)} días")
+        c[1].metric("Estado OC", str(info.get("Estado OC", "—")))
+        da = info.get("Días atraso OC", 0)
+        c[2].metric("Atraso OC", "—" if not da or pd.isna(da) or da <= 0 else f"{int(da)} días")
+        c[3].metric("Nacionalidad", str(info.get("Nacionalidad", "—")))
+
+        st.markdown("**Tiempo de abastecimiento (TAT)**")
+        c = st.columns(4)
+        tp = info.get("TAT Promedio")
+        c[0].metric("TAT promedio", "—" if pd.isna(tp) else f"{tp:.0f} días")
+        c[1].metric("TAT mínimo", "—" if pd.isna(info.get("TAT Min")) else f"{info['TAT Min']:.0f} días")
+        c[2].metric("TAT máximo", "—" if pd.isna(info.get("TAT Max")) else f"{info['TAT Max']:.0f} días")
+        c[3].metric("Recurrencia", str(info.get("Recurrencia", "—")))
+        if pd.isna(tp):
+            st.caption("Este material no tiene historial de compras, por eso no tiene TAT.")
+
+        comentario = info.get("Observación")
+        st.markdown("**Comentario del material**")
+        if pd.isna(comentario) or not str(comentario).strip():
+            st.caption("(Sin comentario)")
+        else:
+            st.info(str(comentario))
+
+        st.markdown("---")
+
+    # ---------------- Tabla completa ----------------
+    st.markdown("#### Todos los materiales")
+    st.caption(f"**{len(datos)} materiales** — con su stock, demanda, gestión, TAT y "
+               "comentario. Ningún material se pierde: si no tiene solped, OC, TAT o "
+               "pronóstico, la celda queda vacía.")
+    cols = [c for c in COLS_CONTROL if c in datos.columns]
+    vista = datos[cols].rename(columns=RENOMBRE_CONTROL).sort_values("Material")
+    st.dataframe(vista, use_container_width=True, hide_index=True)
+    st.download_button("⬇️  Descargar tabla (CSV)",
+                       data=vista.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="control_materiales.csv", mime="text/csv",
+                       key="dl_ctl")
 
 
 # ==========================================================================
@@ -2654,6 +2951,7 @@ repositorio.
 
 PAGINAS = {
     "🏠  Inicio": pagina_inicio,
+    "🎯  Control de Materiales": pagina_control,
     "📈  Demanda y Pronóstico": pagina_demanda,
     "🚚  MRP E002": pagina_mrp_e002,
     "📥  Cargar archivos": pagina_cargar,

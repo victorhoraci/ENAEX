@@ -60,10 +60,46 @@ streamlit run app.py
 | Sección | Página | Qué muestra |
 |---|---|---|
 | Inicio | 🏠 Inicio | Estado de los Excel cargados y resumen de KPIs |
+| 01 Visualizaciones | 🎯 **Control de Materiales** | **Vista integrada**: stock y criticidad, estado del stock, demanda proyectada y tiempo hasta la demanda, si el stock alcanza o no, solped/OC con sus días de gestión, TAT y comentario |
 | 01 Visualizaciones | 📈 Demanda y Pronóstico | Histórico por material (ingresos, egresos, stock), clasificación y pronóstico |
-| 01 Visualizaciones | 🚚 MRP E002 | Solped, OC, días de gestión, nacional/internacional, disponibilidad, TAT y cobertura de demanda |
+| 01 Visualizaciones | 🚚 MRP E002 | Solped, OC, días de gestión, nacional/internacional, disponibilidad y TAT |
 | 02 Datos | 📥 Cargar archivos | Subir las descargas de SAP |
 | 02 Datos | 📖 Cómo usar | Guía completa |
+
+### 🎯 Control de Materiales — qué responde
+
+Para cada material, en una sola tabla:
+
+1. **Material y stock:** código, descripción, centro, área, criticidad, stock,
+   stock de seguridad y **estado del stock** (Sobre Stock · Stock OK · Bajo Stock ·
+   Quiebre Stock).
+2. **Demanda:** tipo de demanda, **demanda proyectada**, **tiempo hasta la próxima
+   demanda**, **stock que queda tras la demanda** y el veredicto:
+
+   | Veredicto | Significa |
+   |---|---|
+   | **Cumple** | El stock cubre la demanda y conserva el stock de seguridad |
+   | **Queda en bajo stock** | Alcanza, pero queda bajo el stock de seguridad |
+   | **Consume todo el stock** | La demanda deja el stock en cero: hay que reponer |
+   | **No cumple** | El stock **no alcanza** para la próxima demanda |
+
+3. **Gestión (semana más actualizada del MRP):** estado (Con Solped · Con OC ·
+   **Solped bloqueada** · **Validación** · Sin gestión), número de solped y OC, y
+   los **días de gestión** de cada una.
+4. **TAT:** promedio, mínimo, máximo y recurrencia de compra.
+5. **Comentario** del material (columna Observación del MRP).
+
+---
+
+## 🧪 Datos de ejemplo (bórralos)
+
+Las carpetas `data/MB51` y `data/MB5B` traen archivos llamados
+**`EJEMPLO_BORRAR_MB51.xlsx`** y **`EJEMPLO_BORRAR_MB5B.xlsx`**. Son datos
+inventados (con códigos de material reales) solo para que el panel arranque
+mostrando todo funcionando.
+
+**Bórralos y sube tus descargas reales de MB51 y MB5B.** Mientras estén, los
+números de demanda no son reales.
 
 ---
 
