@@ -1156,12 +1156,13 @@ def _leer_primera_hoja(ruta, hoja=None, header=0):
     return pd.concat(partes, ignore_index=True)
 
 
-def _fila_encabezado(ruta, hoja, palabra="Material", max_filas=40):
-    """Encuentra la fila (0-index) que contiene 'palabra' en la hoja indicada."""
-    archivos = _listar_excels(ruta)
-    if not archivos:
-        raise FileNotFoundError(f"No se encontraron archivos en: {ruta}")
-    crudo = pd.read_excel(archivos[0], sheet_name=hoja, header=None, nrows=max_filas)
+def _fila_encabezado_archivo(archivo, hoja, palabra="Material", max_filas=40):
+    """
+    Encuentra la fila (0-index) que contiene 'palabra' en la hoja de UN archivo.
+    En el MRP la tabla empieza donde aparece 'Material'; todo lo de arriba es el
+    resumen y se ignora.
+    """
+    crudo = pd.read_excel(archivo, sheet_name=hoja, header=None, nrows=max_filas)
     for i in range(len(crudo)):
         fila = [str(x).strip().lower() for x in crudo.iloc[i].tolist()]
         if palabra.lower() in fila:
@@ -1169,18 +1170,82 @@ def _fila_encabezado(ruta, hoja, palabra="Material", max_filas=40):
     return 0
 
 
+def _fila_encabezado(ruta, hoja, palabra="Material", max_filas=40):
+    """Igual que la anterior, pero tomando el primer archivo de una carpeta."""
+    archivos = _listar_excels(ruta)
+    if not archivos:
+        raise FileNotFoundError(f"No se encontraron archivos en: {ruta}")
+    return _fila_encabezado_archivo(archivos[0], hoja, palabra, max_filas)
+
+
 # --------------------------------------------------------------------------
 # Cargadores por fuente
 # --------------------------------------------------------------------------
+def _fecha_desde_nombre(nombre: str) -> pd.Timestamp | None:
+    """
+    Saca la fecha del NOMBRE del archivo del MRP semanal.
+      'Planificacion_Simpl_-_Prillex_08072026.xlsx'  ->  2026-07-08
+
+    Acepta ddmmyyyy pegado (08072026) y separado (08-07-2026, 08.07.2026, 08_07_2026).
+    Devuelve None si no encuentra una fecha válida.
+    """
+    import re as _re
+    base = str(nombre)
+    # dd-mm-yyyy / dd.mm.yyyy / dd_mm_yyyy  (se prueba primero: es más específico)
+    m = _re.search(r"(\d{1,2})[-._](\d{1,2})[-._](20\d{2})", base)
+    if m:
+        d, mth, y = m.groups()
+        try:
+            return pd.Timestamp(int(y), int(mth), int(d))
+        except ValueError:
+            pass
+    # ddmmyyyy pegado (8 dígitos)
+    m = _re.search(r"(\d{2})(\d{2})(20\d{2})", base)
+    if m:
+        d, mth, y = m.groups()
+        try:
+            return pd.Timestamp(int(y), int(mth), int(d))
+        except ValueError:
+            pass
+    return None
+
+
+def _etiqueta_semana(fecha) -> str | None:
+    """
+    Devuelve la semana en formato 'AÑO-Sxx' (p. ej. 2026-S28).
+    Lleva el año adelante a propósito: así ordena bien al cambiar de año
+    (2026-S52 -> 2027-S01), cosa que 'Semana 28' sola no permite.
+    """
+    if pd.isna(fecha):
+        return None
+    iso = pd.Timestamp(fecha).isocalendar()
+    return f"{iso[0]}-S{int(iso[1]):02d}"
+
+
 def cargar_mrp(ruta=None) -> pd.DataFrame:
-    """MRP semanal: hoja 'data', encabezados donde aparece 'Material'."""
+    """
+    MRP semanal: hoja 'data', encabezados donde aparece 'Material'.
+
+    ACUMULA: lee TODOS los archivos de la carpeta (uno por semana) y a cada fila
+    le agrega la fecha y la semana tomadas del NOMBRE del archivo
+    ('..._08072026.xlsx' -> 08-07-2026 -> semana 2026-S28).
+    Así se puede ver la evolución y comparar contra la semana anterior.
+    """
     ruta = ruta or config.CARPETA_MRP
     archivos = _listar_excels(ruta)
     if not archivos:
         raise FileNotFoundError(f"No se encontró el MRP semanal en: {ruta}")
     hoja = "data"
-    fila = _fila_encabezado(ruta, hoja)
-    partes = [pd.read_excel(a, sheet_name=hoja, header=fila) for a in archivos]
+
+    partes = []
+    for a in archivos:
+        fila = _fila_encabezado_archivo(a, hoja)
+        df_a = pd.read_excel(a, sheet_name=hoja, header=fila)
+        fecha = _fecha_desde_nombre(a.name)
+        df_a["Fecha MRP"] = fecha
+        df_a["Semana"] = _etiqueta_semana(fecha)
+        df_a["Archivo MRP"] = a.name
+        partes.append(df_a)
     df = pd.concat(partes, ignore_index=True)
 
     mapeo = {
@@ -1219,9 +1284,16 @@ def cargar_mrp(ruta=None) -> pd.DataFrame:
         df["Fecha de entrega"] = _parse_fecha(df["Fecha de entrega"])
     if "Criticidad" in df.columns:
         df["Criticidad"] = df["Criticidad"].fillna("").astype(str).str.strip()
-    # Si hay varias semanas cargadas, se queda con el último estado por material+centro
-    df = df.drop_duplicates(subset=["Material", "Centro"], keep="last")
-    return df.reset_index(drop=True)
+    # Dedupe DENTRO de cada semana (no entre semanas: el histórico se conserva)
+    df = df.drop_duplicates(subset=["Material", "Centro", "Semana"], keep="last")
+    return df.sort_values(["Fecha MRP", "Material"]).reset_index(drop=True)
+
+
+def semanas_disponibles(ruta=None) -> list[str]:
+    """Lista ordenada de las semanas cargadas del MRP (p. ej. ['2026-S26', '2026-S28'])."""
+    df = cargar_mrp(ruta)
+    sem = sorted(s for s in df["Semana"].dropna().unique())
+    return sem
 
 
 def cargar_mm60(ruta=None) -> pd.DataFrame:
@@ -1373,6 +1445,51 @@ def _tiene_valor(serie: pd.Series) -> pd.Series:
     """Máscara booleana: True donde hay un código real (no nulo/vacío/'none'/'nan')."""
     s = serie.astype(str).str.strip().str.lower()
     return serie.notna() & ~s.isin(["", "nan", "none"])
+
+
+def historial_semanal(mrp=None) -> pd.DataFrame:
+    """
+    Resumen por semana con TODOS los MRP históricos cargados. Sirve para ver la
+    evolución y comparar contra la semana anterior.
+
+    Devuelve una fila por semana con: materiales, disponibilidad (%), sin stock,
+    bajo stock, con solped, con OC, solped bloqueadas, en validación, y la
+    disponibilidad de los materiales críticos (A).
+    """
+    todas = cargar_mrp(mrp)
+    filas = []
+    for semana, g in todas.groupby("Semana", sort=True):
+        g = g.drop_duplicates(subset=["Material", "Centro"], keep="last")
+        total = len(g)
+        if total == 0:
+            continue
+        cond = g["Condicion Stock"] if "Condicion Stock" in g.columns else pd.Series(dtype=str)
+        obs = g["Observación"].fillna("").astype(str).str.lower() if "Observación" in g.columns else pd.Series([""] * total)
+        tiene_oc = _tiene_valor(g["OC en Transito"]) if "OC en Transito" in g.columns else pd.Series([False] * total)
+        tiene_sol = _tiene_valor(g["Solped"]) if "Solped" in g.columns else pd.Series([False] * total)
+        quiebre = int((cond == "Quiebre Stock").sum())
+
+        fila = {
+            "Semana": semana,
+            "Fecha": g["Fecha MRP"].iloc[0],
+            "Materiales": total,
+            "Disponibilidad": round(100 * (total - quiebre) / total, 2),
+            "Sin stock": quiebre,
+            "Bajo stock": int((cond == "Bajo Stock").sum()),
+            "Con OC": int(tiene_oc.sum()),
+            "Con Solped": int(tiene_sol.sum()),
+            "Solped bloqueada": int(obs.str.contains("bloque").sum()),
+            "Validación": int(obs.str.contains("validac").sum()),
+        }
+        if "Criticidad" in g.columns:
+            crit = g[g["Criticidad"] == "A"]
+            if len(crit):
+                q = int((crit["Condicion Stock"] == "Quiebre Stock").sum())
+                fila["Disponibilidad A"] = round(100 * (len(crit) - q) / len(crit), 2)
+        filas.append(fila)
+
+    hist = pd.DataFrame(filas)
+    return hist.sort_values("Semana").reset_index(drop=True) if not hist.empty else hist
 
 
 def estado_archivos() -> list[dict]:
@@ -1541,11 +1658,23 @@ class ResultadoAbastecimiento:
 
 def construir_abastecimiento(
     mrp=None, mm60=None, me5a=None, me2m=None, tat=None,
-    hoy: pd.Timestamp | None = None,
+    hoy: pd.Timestamp | None = None, semana: str | None = None,
 ) -> ResultadoAbastecimiento:
+    """
+    Integra todas las fuentes para UNA semana del MRP.
+
+    semana : etiqueta 'AÑO-Sxx' (p. ej. '2026-S28'). Si es None, usa la más
+             reciente que haya cargada.
+    """
     hoy = (hoy or pd.Timestamp.today()).normalize()
 
-    base = cargar_mrp(mrp)
+    todas = cargar_mrp(mrp)
+    # Elegir la semana a mostrar (por defecto, la última cargada)
+    semanas = sorted(s for s in todas["Semana"].dropna().unique())
+    if semana is None:
+        semana = semanas[-1] if semanas else None
+    base = todas[todas["Semana"] == semana].copy() if semana else todas.copy()
+    base = base.drop_duplicates(subset=["Material", "Centro"], keep="last")
 
     # --- MM60 por Material + Centro ---
     try:
@@ -1932,9 +2061,58 @@ def cargar_demanda():
 
 
 @st.cache_data(show_spinner="Integrando MRP + MM60 + ME5A + ME2M + TAT…")
-def cargar_abastecimiento():
-    r = construir_abastecimiento()
+def cargar_abastecimiento(semana=None):
+    r = construir_abastecimiento(semana=semana)
     return r.tabla, r.kpis
+
+
+@st.cache_data(show_spinner="Leyendo el histórico semanal del MRP…")
+def cargar_historial():
+    return historial_semanal()
+
+
+@st.cache_data(show_spinner=False)
+def cargar_semanas():
+    try:
+        return semanas_disponibles()
+    except Exception:
+        return []
+
+
+def selector_semana(key: str):
+    """
+    Selector de la semana del MRP. Por defecto muestra la más reciente.
+    Devuelve (semana_elegida, semana_anterior o None).
+    """
+    semanas = cargar_semanas()
+    if not semanas:
+        return None, None
+    with st.sidebar:
+        st.markdown("### Semana del MRP")
+        elegida = st.selectbox(
+            "Semana", semanas, index=len(semanas) - 1, key=key,
+            help="Se muestra la semana más reciente. Puedes ver semanas anteriores.",
+        )
+        if len(semanas) > 1:
+            st.caption(f"{len(semanas)} semanas cargadas")
+        else:
+            st.caption("Solo hay 1 semana cargada. Sube más MRP para ver la evolución.")
+    i = semanas.index(elegida)
+    anterior = semanas[i - 1] if i > 0 else None
+    return elegida, anterior
+
+
+def _delta(actual, previo, invertir=True):
+    """
+    Diferencia contra la semana anterior para st.metric.
+    invertir=True -> que suba es MALO (rojo): sin stock, OC atrasadas…
+    """
+    if previo is None or pd.isna(previo):
+        return None
+    d = actual - previo
+    if d == 0:
+        return "0 vs sem. anterior"
+    return f"{d:+g} vs sem. anterior"
 
 
 def _card(lbl, val, sub=""):
@@ -2235,8 +2413,9 @@ def pagina_mrp_e002():
         '<p>Solped, OC, días de gestión, nacionalidad, disponibilidad, TAT y demanda</p></div>',
         unsafe_allow_html=True,
     )
+    semana, sem_prev = selector_semana("sem_ab")
     try:
-        tabla, kpis = cargar_abastecimiento()
+        tabla, kpis = cargar_abastecimiento(semana)
     except FileNotFoundError:
         st.error("Falta el **MRP semanal**, que es la base de este panel.")
         tabla_estado_archivos(expandido=True)
@@ -2281,20 +2460,46 @@ def pagina_mrp_e002():
         st.warning("Ningún material coincide con los filtros.")
         return
 
+    if semana:
+        st.caption(f"📅 Semana **{semana}**"
+                   + (f" · comparada con **{sem_prev}**" if sem_prev else ""))
+
+    # Datos de la semana anterior para las comparaciones
+    prev = None
+    if sem_prev:
+        try:
+            hist = cargar_historial()
+            fila = hist[hist["Semana"] == sem_prev]
+            prev = fila.iloc[0] if len(fila) else None
+        except Exception:
+            prev = None
+
     total = len(datos)
     sin_stock = int((datos["Condicion Stock"] == "Quiebre Stock").sum())
     dispo = round(100 * (total - sin_stock) / total, 1) if total else 0
+    atrasadas = int((datos["Estado OC"] == "Atrasada").sum())
+    bloq = int((datos["Estado gestión"] == "Solped bloqueada").sum())
+    valid = int((datos["Estado gestión"] == "Validación").sum())
+
     k = st.columns(7)
     k[0].metric("Materiales", f"{total:,}".replace(",", "."))
-    k[1].metric("Disponibilidad", f"{dispo} %")
-    k[2].metric("Sin stock", sin_stock)
-    k[3].metric("OC atrasadas", int((datos["Estado OC"] == "Atrasada").sum()))
+    k[1].metric("Disponibilidad", f"{dispo} %",
+                delta=_delta(dispo, prev["Disponibilidad"] if prev is not None else None))
+    k[2].metric("Sin stock", sin_stock,
+                delta=_delta(sin_stock, prev["Sin stock"] if prev is not None else None),
+                delta_color="inverse")
+    k[3].metric("OC atrasadas", atrasadas)
     k[4].metric("OC en curso", int((datos["Estado OC"] == "En curso").sum()))
-    k[5].metric("Solped bloqueadas", int((datos["Estado gestión"] == "Solped bloqueada").sum()))
-    k[6].metric("En validación", int((datos["Estado gestión"] == "Validación").sum()))
+    k[5].metric("Solped bloqueadas", bloq,
+                delta=_delta(bloq, prev["Solped bloqueada"] if prev is not None else None),
+                delta_color="inverse")
+    k[6].metric("En validación", valid,
+                delta=_delta(valid, prev["Validación"] if prev is not None else None),
+                delta_color="inverse")
 
-    t1, t2, t3, t4 = st.tabs(["📌  Gestión (solped / OC)", "📊  Resumen",
-                              "📦  Demanda vs Stock", "📋  Todos los materiales"])
+    t1, t2, t3, t4, t5 = st.tabs(["📌  Gestión (solped / OC)", "📊  Resumen",
+                                  "📈  Evolución semanal", "📦  Demanda vs Stock",
+                                  "📋  Todos los materiales"])
 
     # ---------------- Gestión ----------------
     with t1:
@@ -2430,8 +2635,75 @@ def pagina_mrp_e002():
             st.dataframe(res.sort_values("Disponibilidad"),
                          use_container_width=True, hide_index=True)
 
-    # ---------------- Demanda vs Stock ----------------
+    # ---------------- Evolución semanal ----------------
     with t3:
+        st.markdown("#### Evolución semana a semana")
+        st.caption("Usa **todos** los MRP históricos cargados. Cada archivo nuevo "
+                   "que subas agrega una semana más a estos gráficos.")
+        try:
+            hist = cargar_historial()
+        except Exception as e:
+            st.error(f"No se pudo leer el histórico: {e}")
+            hist = pd.DataFrame()
+
+        if hist.empty:
+            st.info("Todavía no hay histórico.")
+        elif len(hist) == 1:
+            st.info(f"Solo hay **1 semana** cargada ({hist['Semana'].iloc[0]}). "
+                    "Sube los MRP de semanas anteriores en **📥 Cargar archivos** "
+                    "para ver la evolución. Recuerda que la fecha va en el nombre "
+                    "del archivo (por ejemplo `..._08072026.xlsx`).")
+            st.dataframe(hist, use_container_width=True, hide_index=True)
+        else:
+            def linea(cols, titulo, eje="Materiales"):
+                fig = go.Figure()
+                colores = {"Disponibilidad": "#27AE60", "Disponibilidad A": "#1565C0",
+                           "Sin stock": "#E74C3C", "Bajo stock": "#F39C12",
+                           "Con OC": "#2E86DE", "Con Solped": "#2E7D32",
+                           "Solped bloqueada": "#C62828", "Validación": "#E65100"}
+                for c in cols:
+                    if c in hist.columns:
+                        fig.add_trace(go.Scatter(
+                            x=hist["Semana"], y=hist[c], name=c, mode="lines+markers",
+                            line=dict(width=2.5, color=colores.get(c)),
+                            marker=dict(size=7)))
+                fig.update_layout(title=titulo, height=330,
+                                  margin=dict(l=10, r=10, t=45, b=10),
+                                  plot_bgcolor="#fff", paper_bgcolor="#fff",
+                                  hovermode="x unified",
+                                  legend=dict(orientation="h", y=1.02, yanchor="bottom"),
+                                  xaxis=dict(title="", showgrid=False),
+                                  yaxis=dict(title=eje, showgrid=True, gridcolor="#EEF1F4"))
+                return fig
+
+            e1, e2 = st.columns(2)
+            with e1:
+                st.plotly_chart(linea(["Disponibilidad", "Disponibilidad A"],
+                                      "% Disponibilidad por semana", "%"),
+                                use_container_width=True)
+            with e2:
+                st.plotly_chart(linea(["Sin stock", "Bajo stock"],
+                                      "Materiales sin stock / bajo stock"),
+                                use_container_width=True)
+            e3, e4 = st.columns(2)
+            with e3:
+                st.plotly_chart(linea(["Con OC", "Con Solped"],
+                                      "Materiales con OC y con solped"),
+                                use_container_width=True)
+            with e4:
+                st.plotly_chart(linea(["Solped bloqueada", "Validación"],
+                                      "Solped bloqueadas y validaciones"),
+                                use_container_width=True)
+
+            st.markdown("##### Detalle por semana")
+            st.dataframe(hist, use_container_width=True, hide_index=True)
+            st.download_button("⬇️  Descargar histórico (CSV)",
+                               data=hist.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="historico_semanal.csv", mime="text/csv",
+                               key="dl_hist")
+
+    # ---------------- Demanda vs Stock ----------------
+    with t4:
         st.markdown("#### Demanda vs stock: ¿alcanza para la próxima demanda?")
         st.caption("*Cumple* = el stock cubre la demanda y deja el stock de seguridad · "
                    "*Alerta* = alcanza pero se come el stock de seguridad · "
@@ -2470,7 +2742,7 @@ def pagina_mrp_e002():
                      use_container_width=True, hide_index=True)
 
     # ---------------- Todos los materiales ----------------
-    with t4:
+    with t5:
         st.markdown("#### Todos los materiales")
         st.caption(f"**{len(datos)} materiales** — ningún material se pierde, "
                    "tengan o no solped, OC, TAT o pronóstico.")
@@ -2587,8 +2859,9 @@ def pagina_control():
         '<p>Stock · demanda proyectada · cobertura · gestión de solped y OC · TAT</p></div>',
         unsafe_allow_html=True,
     )
+    semana, sem_prev = selector_semana("sem_ctl")
     try:
-        tabla, kpis = cargar_abastecimiento()
+        tabla, kpis = cargar_abastecimiento(semana)
     except FileNotFoundError:
         st.error("Falta el **MRP semanal**, que es la base de esta vista.")
         tabla_estado_archivos(expandido=True)
@@ -2596,6 +2869,10 @@ def pagina_control():
     except Exception as e:
         st.error(f"No se pudieron integrar los datos: {e}")
         return
+
+    if semana:
+        st.caption(f"📅 Mostrando la semana **{semana}**"
+                   + (f" · comparando con **{sem_prev}**" if sem_prev else ""))
 
     datos = tabla.copy()
 
@@ -2797,7 +3074,7 @@ def pagina_cargar():
 |---|---|---|---|---|
 | **MB51** | MB51 | Layout **`/CALCDEMANDA`** ("MOV. PARA PRONOSTICO DE DEMANDA") | Semanal | **Reemplaza** |
 | **MB5B** | MB5B | Columnas: Material · Descripción del material · De fecha · A fecha · Stock inicial · Total ctd.entrada mcía. · Total cantidades salida · Stock de cierre · Unidad medida base · Stock especial | Mensual | **Se agrega** |
-| **MRP semanal** | Planificacion_Simpl | Hoja `data` | Semanal | **Reemplaza** |
+| **MRP semanal** | Planificacion_Simpl | Hoja `data` | Semanal | **Se agrega** (fecha en el nombre) |
 | **MM60** | MM60 | — | Mensual | **Reemplaza** |
 | **ME5A** | ME5A | — | Semanal | **Reemplaza** |
 | **ME2M** | ME2M | — | Semanal | **Reemplaza** |
@@ -2833,14 +3110,19 @@ def pagina_cargar():
     fuentes = [
         ("MB51 — movimientos (Demanda)", "MB51", CARPETA_MB51, True),
         ("MB5B — stock del mes (Demanda)", "MB5B", CARPETA_MB5B, False),
-        ("MRP semanal — Planificacion_Simpl", "MRP", CARPETA_MRP, True),
+        ("MRP semanal — Planificacion_Simpl", "MRP", CARPETA_MRP, False),
         ("MM60 — maestro de materiales", "MM60", CARPETA_MM60, True),
         ("ME5A — solicitudes (solped)", "ME5A", CARPETA_ME5A, True),
         ("ME2M — órdenes de compra", "ME2M", CARPETA_ME2M, True),
         ("TAT — Vista Ejecutiva (hoja Dias_TAT)", "TAT", CARPETA_TAT, True),
     ]
+    st.info("📌 El **MRP semanal** y el **MB5B** se **acumulan**: cada archivo nuevo "
+            "se suma a los anteriores para poder ver la evolución en el tiempo. "
+            "Por eso el MRP debe traer **la fecha en el nombre** "
+            "(por ejemplo `Planificacion_Simpl_-_Prillex_08072026.xlsx`), que es de "
+            "donde se saca la semana. El resto de archivos reemplaza al anterior.")
     for etiqueta, sub, carpeta, reemplaza in fuentes:
-        modo = "reemplaza el anterior" if reemplaza else "**se agrega** a los anteriores"
+        modo = "**reemplaza** el anterior" if reemplaza else "**se agrega** a los anteriores"
         st.markdown(f"##### {etiqueta}")
         st.caption(f"Al subirlo, {modo}.")
         archivo = st.file_uploader(etiqueta, type=["xlsx", "xls"], key=f"up_{sub}",
