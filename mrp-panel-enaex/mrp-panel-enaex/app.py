@@ -1745,6 +1745,14 @@ def construir_abastecimiento(
     # --- Derivaciones ---
     base["Material_Centro"] = base["Material"].astype(str) + "_" + base["Centro"].astype(str)
     base["Estado gestión"] = base.apply(_estado_gestion, axis=1)
+    # Área vacía -> BODEGA (para que esos materiales sean visibles y filtrables)
+    if "Area" in base.columns:
+        base["Area"] = base["Area"].fillna("BODEGA").astype(str).str.strip()
+        base.loc[base["Area"].str.lower().isin(["", "nan", "none"]), "Area"] = "BODEGA"
+    # Indicador ABC vacío -> clase "B" (ni A ni C se consideran B)
+    if "Indicador ABC" in base.columns:
+        abc = base["Indicador ABC"].fillna("").astype(str).str.strip().str.upper()
+        base["Indicador ABC"] = abc.where(abc.isin(["A", "C"]), "B")
     base["Criticidad texto"] = base["Criticidad"].apply(_criticidad_texto) if "Criticidad" in base.columns else "Sin criticidad"
     base["Nacionalidad"] = base["OC en Transito"].apply(_nacionalidad_oc)
 
@@ -2161,6 +2169,36 @@ def _delta(actual, previo, invertir=True):
     return f"{d:+g} vs sem. anterior"
 
 
+SIN_DATO = "(sin dato)"
+
+
+def filtro_multi(datos, col, etiqueta, key):
+    """
+    Multiselect que NO pierde materiales: los valores vacíos se muestran como
+    '(sin dato)' y quedan seleccionados por defecto. Devuelve la selección.
+    """
+    if col not in datos.columns:
+        return None
+    vals = datos[col].astype(str).str.strip()
+    opciones = sorted(v for v in vals.unique() if v and v.lower() != "nan")
+    hay_vacios = (vals == "").any() or (vals.str.lower() == "nan").any() or datos[col].isna().any()
+    if hay_vacios:
+        opciones = opciones + [SIN_DATO]
+    return st.multiselect(etiqueta, opciones, default=opciones, key=key)
+
+
+def aplicar_filtro(datos, col, seleccion):
+    """Aplica la selección de filtro_multi respetando los '(sin dato)'."""
+    if seleccion is None or col not in datos.columns:
+        return datos
+    vals = datos[col].astype(str).str.strip()
+    es_vacio = datos[col].isna() | (vals == "") | (vals.str.lower() == "nan")
+    mask = vals.isin(seleccion)
+    if SIN_DATO in seleccion:
+        mask = mask | es_vacio
+    return datos[mask]
+
+
 def _card(lbl, val, sub=""):
     return (f'<div class="metric-card"><div class="lbl">{lbl}</div>'
             f'<div class="val">{val}</div><div class="sub">{sub}</div></div>')
@@ -2476,21 +2514,14 @@ def pagina_mrp_e002():
 
     with st.sidebar:
         st.markdown("### Filtros")
-
-        def _multi(col, etiqueta):
-            if col not in tabla.columns:
-                return None
-            ops = sorted(str(x) for x in tabla[col].dropna().unique() if str(x).strip())
-            return st.multiselect(etiqueta, ops, default=ops)
-
-        f_centro = _multi("Centro", "Centro")
-        f_area = _multi("Area", "Área")
-        f_crit = _multi("Criticidad texto", "Criticidad")
-        f_cond = _multi("Condicion Stock", "Condición de stock")
-        f_gest = _multi("Estado gestión", "Estado de gestión")
-        f_oc = _multi("Estado OC", "Estado de la OC")
-        f_nac = _multi("Nacionalidad", "Nacionalidad de la OC")
-        f_rec = _multi("Recurrencia", "Recurrencia de compra (TAT)")
+        f_centro = filtro_multi(tabla, "Centro", "Centro", "ab_Centro")
+        f_area = filtro_multi(tabla, "Area", "Área", "ab_Area")
+        f_crit = filtro_multi(tabla, "Criticidad texto", "Criticidad", "ab_Crit")
+        f_cond = filtro_multi(tabla, "Condicion Stock", "Condición de stock", "ab_Cond")
+        f_gest = filtro_multi(tabla, "Estado gestión", "Estado de gestión", "ab_Gest")
+        f_oc = filtro_multi(tabla, "Estado OC", "Estado de la OC", "ab_OC")
+        f_nac = filtro_multi(tabla, "Nacionalidad", "Nacionalidad de la OC", "ab_Nac")
+        f_rec = filtro_multi(tabla, "Recurrencia", "Recurrencia de compra (TAT)", "ab_Rec")
         if st.button("🔄 Recargar datos", key="rec_ab"):
             st.cache_data.clear()
             st.rerun()
@@ -2499,8 +2530,7 @@ def pagina_mrp_e002():
     for col, sel in [("Centro", f_centro), ("Area", f_area), ("Criticidad texto", f_crit),
                      ("Condicion Stock", f_cond), ("Estado gestión", f_gest),
                      ("Estado OC", f_oc), ("Nacionalidad", f_nac), ("Recurrencia", f_rec)]:
-        if sel is not None and col in datos.columns:
-            datos = datos[datos[col].astype(str).isin(sel)]
+        datos = aplicar_filtro(datos, col, sel)
 
     if datos.empty:
         st.warning("Ningún material coincide con los filtros.")
@@ -2973,19 +3003,12 @@ def pagina_control():
     # ---------------- Filtros ----------------
     with st.sidebar:
         st.markdown("### Filtros")
-
-        def _multi(col, etiqueta):
-            if col not in datos.columns:
-                return None
-            ops = sorted(str(x) for x in datos[col].dropna().unique() if str(x).strip())
-            return st.multiselect(etiqueta, ops, default=ops, key=f"ctl_{col}")
-
-        f_centro = _multi("Centro", "Centro")
-        f_area = _multi("Area", "Área")
-        f_crit = _multi("Criticidad texto", "Criticidad")
-        f_cond = _multi("Condicion Stock", "Estado del stock")
-        f_res = _multi("Resultado demanda", "¿Cumple la demanda?")
-        f_gest = _multi("Estado gestión", "Gestión (solped / OC)")
+        f_centro = filtro_multi(datos, "Centro", "Centro", "ctl_Centro")
+        f_area = filtro_multi(datos, "Area", "Área", "ctl_Area")
+        f_crit = filtro_multi(datos, "Criticidad texto", "Criticidad", "ctl_Crit")
+        f_cond = filtro_multi(datos, "Condicion Stock", "Estado del stock", "ctl_Cond")
+        f_res = filtro_multi(datos, "Resultado demanda", "¿Cumple la demanda?", "ctl_Res")
+        f_gest = filtro_multi(datos, "Estado gestión", "Gestión (solped / OC)", "ctl_Gest")
         if st.button("🔄 Recargar datos", key="rec_ctl"):
             st.cache_data.clear()
             st.rerun()
@@ -2993,8 +3016,7 @@ def pagina_control():
     for col, sel in [("Centro", f_centro), ("Area", f_area), ("Criticidad texto", f_crit),
                      ("Condicion Stock", f_cond), ("Resultado demanda", f_res),
                      ("Estado gestión", f_gest)]:
-        if sel is not None and col in datos.columns:
-            datos = datos[datos[col].astype(str).isin(sel)]
+        datos = aplicar_filtro(datos, col, sel)
 
     if datos.empty:
         st.warning("Ningún material coincide con los filtros.")
@@ -3178,24 +3200,16 @@ def pagina_costos():
     # Filtros
     with st.sidebar:
         st.markdown("### Filtros")
-
-        def _multi(col, etiqueta):
-            if col not in datos.columns:
-                return None
-            ops = sorted(str(x) for x in datos[col].dropna().unique() if str(x).strip())
-            return st.multiselect(etiqueta, ops, default=ops, key=f"cost_{col}")
-
-        f_centro = _multi("Centro", "Centro")
-        f_grupo = _multi("Grupo de compras", "Grupo de compra")
-        f_cond = _multi("Condicion Stock", "Estado del stock")
+        f_centro = filtro_multi(datos, "Centro", "Centro", "cost_Centro")
+        f_grupo = filtro_multi(datos, "Grupo de compras", "Grupo de compra", "cost_Grupo")
+        f_cond = filtro_multi(datos, "Condicion Stock", "Estado del stock", "cost_Cond")
         if st.button("🔄 Recargar datos", key="rec_cost"):
             st.cache_data.clear()
             st.rerun()
 
     for col, sel in [("Centro", f_centro), ("Grupo de compras", f_grupo),
                      ("Condicion Stock", f_cond)]:
-        if sel is not None and col in datos.columns:
-            datos = datos[datos[col].astype(str).isin(sel)]
+        datos = aplicar_filtro(datos, col, sel)
 
     if datos.empty:
         st.warning("Ningún material coincide con los filtros.")
