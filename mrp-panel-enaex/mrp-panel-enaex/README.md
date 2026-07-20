@@ -62,6 +62,7 @@ streamlit run app.py
 | Inicio | 🏠 Inicio | Estado de los Excel cargados y resumen de KPIs |
 | 01 Visualizaciones | 🎯 **Control de Materiales** | **Vista integrada**: stock y criticidad, estado del stock, demanda proyectada y tiempo hasta la demanda, si el stock alcanza o no, solped/OC con sus días de gestión, TAT y comentario |
 | 01 Visualizaciones | 📈 Demanda y Pronóstico | Histórico por material (ingresos, egresos, stock), clasificación y pronóstico |
+| 01 Visualizaciones | 💰 **Costos** | Valor del stock total, por condición, por grupo de compra y valor en tránsito |
 | 01 Visualizaciones | 🚚 MRP E002 | Solped, OC, días de gestión, nacional/internacional, disponibilidad y TAT |
 | 02 Datos | 📥 Cargar archivos | Subir las descargas de SAP |
 | 02 Datos | 📖 Cómo usar | Guía completa |
