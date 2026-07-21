@@ -1960,6 +1960,24 @@ def _unir_demanda(base: pd.DataFrame) -> pd.DataFrame:
             holguras.append(h)
         base["Acción de compra"] = acciones
         base["Holgura días (demanda - TAT)"] = holguras
+
+        # Criticidad de gestionar la OC/solped: compara TAT con el tiempo hasta la
+        # demanda (independiente de si cubre o no el stock). Sirve para priorizar
+        # la gestión de solped/OC ya abiertas.
+        def _urgencia_oc(dd, tt):
+            if pd.isna(tt) or tt <= 0:
+                return "Sin dato TAT"
+            if pd.isna(dd):
+                return "Sin demanda próxima"
+            dif = dd - tt  # días de holgura entre que pides y se necesita
+            if dif < 0:
+                return "Urgente (TAT supera la demanda)"
+            if dif <= 10:
+                return "Urgente"
+            if dif <= 30:
+                return "Agilizar"
+            return "Gestionar normal"
+        base["Urgencia OC"] = [_urgencia_oc(dd, tt) for dd, tt in zip(dias_dem, tat)]
     return base
 
 
@@ -2512,7 +2530,18 @@ def pagina_demanda():
     info = tabla_f[tabla_f["Material"] == material].iloc[0]
 
     st.markdown(f"### {info['Descripción del material'] or material}")
-    c1, c2, c3, c4, c5 = st.columns(5)
+
+    # Traer datos de abastecimiento (stock, seguridad, lote, TAT, OC/solped, cobertura)
+    info_ab = None
+    try:
+        tabla_ab, _ = cargar_abastecimiento()
+        fila_ab = tabla_ab[tabla_ab["Material"].astype(str) == str(material)]
+        if len(fila_ab):
+            info_ab = fila_ab.iloc[0]
+    except Exception:
+        info_ab = None
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.markdown(_card("Material", f'<span class="mono">{info["Material"]}</span>',
                           f'Centro {info["Centro"]}'), unsafe_allow_html=True)
@@ -2524,13 +2553,49 @@ def pagina_demanda():
         st.markdown(_card("Pronóstico", "—" if pd.isna(p) else f"{int(p)}",
                           "próxima demanda"), unsafe_allow_html=True)
     with c4:
+        # Stock actual (del MRP) junto al pronóstico
+        stock_ab = info_ab.get("Stock") if info_ab is not None else None
+        cond_ab = info_ab.get("Condicion Stock") if info_ab is not None else ""
+        st.markdown(_card("Stock actual",
+                          "—" if stock_ab is None or pd.isna(stock_ab) else f"{stock_ab:g}",
+                          str(cond_ab) if cond_ab and pd.notna(cond_ab) else "según MRP"),
+                    unsafe_allow_html=True)
+    with c5:
         st.markdown(_card("Tiempo hasta demanda",
                           str(info.get("Tiempo_hasta_demanda", "—")), "estimado"),
                     unsafe_allow_html=True)
-    with c5:
+    with c6:
         mi = info.get("PR_Media_Intervalo")
         st.markdown(_card("Intervalo de demanda", "—" if pd.isna(mi) else f"{mi:g} meses",
                           "promedio entre demandas"), unsafe_allow_html=True)
+
+    # Segunda fila: datos de gestión y cobertura (desde abastecimiento)
+    if info_ab is not None:
+        d1, d2, d3, d4, d5, d6 = st.columns(6)
+        seg = info_ab.get("Stock Seguridad")
+        d1.metric("Stock de seguridad", "—" if pd.isna(seg) else f"{seg:g}")
+        lote = info_ab.get("Cantidad de Compra")
+        d2.metric("Lote de compra", "—" if pd.isna(lote) else f"{lote:g}")
+        tat = info_ab.get("TAT Promedio")
+        d3.metric("TAT promedio", "—" if pd.isna(tat) else f"{tat:.0f} días")
+        d4.metric("¿Cumple demanda?", str(info_ab.get("Resultado demanda", "—")))
+        # OC / solped asociada
+        est_g = str(info_ab.get("Estado gestión", ""))
+        if est_g == "Con OC":
+            d5.metric("Gestión", "Con OC",
+                      help=f"OC {info_ab.get('OC en Transito','')}")
+            oc_d = info_ab.get("Días de OC")
+            d5.caption(f"OC {info_ab.get('OC en Transito','')}"
+                       + (f" · {int(oc_d)} d" if pd.notna(oc_d) else ""))
+        elif est_g in ("Con Solped", "Solped bloqueada", "Validación"):
+            d5.metric("Gestión", est_g)
+            sol_d = info_ab.get("Días en solped")
+            d5.caption(f"Solped {info_ab.get('Solped','')}"
+                       + (f" · {int(sol_d)} d" if pd.notna(sol_d) else ""))
+        else:
+            d5.metric("Gestión", "Sin gestión")
+        # Acción de compra recomendada
+        d6.metric("Acción sugerida", str(info_ab.get("Acción de compra", "—")))
 
     st.markdown("")
     serie_mat = serie[(serie["Material"] == material)
@@ -2704,33 +2769,57 @@ def pagina_mrp_e002():
             st.caption(f"{len(prio)} materiales requieren gestión inmediata.")
 
         st.markdown("---")
+        # Tiempo hasta la demanda en texto (para las tablas de solped/OC)
+        if "Tiempo_Prox_Demanda" in datos.columns:
+            datos["Tiempo demanda (días)"] = (
+                pd.to_numeric(datos["Tiempo_Prox_Demanda"], errors="coerce") * 30
+            ).round()
+
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("##### 📄 Solped en curso (con días de gestión)")
+            st.caption("Incluye el TAT, el tiempo hasta la demanda y si es crítico "
+                       "convertirla en OC (según TAT vs demanda).")
             sol = datos[datos["Estado gestión"] == "Con Solped"]
             cols_s = [c for c in ["Material", "Texto breve de material", "Solped",
-                                  "Días en solped", "Rango días solped", "Condicion Stock",
-                                  "Criticidad texto"] if c in sol.columns]
+                                  "Días en solped", "TAT Promedio", "Tiempo demanda (días)",
+                                  "Urgencia OC", "Condicion Stock", "Criticidad texto"]
+                      if c in sol.columns]
             if sol.empty:
                 st.info("No hay materiales con solped en curso.")
             else:
-                st.dataframe(sol[cols_s].sort_values("Días en solped", ascending=False),
-                             use_container_width=True, hide_index=True)
+                orden_u = {"Urgente (TAT supera la demanda)": 0, "Urgente": 1,
+                           "Agilizar": 2, "Gestionar normal": 3}
+                sol_v = sol[cols_s].assign(
+                    _o=sol["Urgencia OC"].map(lambda x: orden_u.get(x, 4)).values
+                ).sort_values(["_o", "Días en solped"], ascending=[True, False]).drop(columns="_o")
+                st.dataframe(sol_v.rename(columns={
+                    "Texto breve de material": "Descripción",
+                    "TAT Promedio": "TAT (días)",
+                    "Urgencia OC": "¿Crítico hacer OC?"}),
+                    use_container_width=True, hide_index=True)
                 orden = ["0-10 días", "11-20 días", "21-30 días", "31+ días"]
                 conteo = {o: int((sol["Rango días solped"] == o).sum()) for o in orden}
                 st.plotly_chart(barras(conteo, {}, "Antigüedad de las solped", True),
                                 use_container_width=True)
         with c2:
             st.markdown("##### 🚚 OC en tránsito (con días y atraso)")
+            st.caption("Incluye la próxima demanda, el stock actual, el tiempo hasta "
+                       "la demanda y si el stock la cubre o no.")
             oc = datos[datos["Estado OC"].isin(["Atrasada", "En curso"])]
             cols_o = [c for c in ["Material", "Texto breve de material", "OC en Transito",
-                                  "Nacionalidad", "Estado OC", "Días de OC",
-                                  "Días atraso OC", "Días hasta llegada", "Proveedor"]
+                                  "Nacionalidad", "Estado OC", "Días de OC", "Días atraso OC",
+                                  "Stock", "Pronostico_Consolidado", "Tiempo demanda (días)",
+                                  "Resultado demanda", "Proveedor"]
                       if c in oc.columns]
             if oc.empty:
                 st.info("No hay OC en tránsito.")
             else:
-                st.dataframe(oc[cols_o].sort_values("Días atraso OC", ascending=False),
+                st.dataframe(oc[cols_o].sort_values("Días atraso OC", ascending=False)
+                             .rename(columns={
+                                 "Texto breve de material": "Descripción",
+                                 "Pronostico_Consolidado": "Demanda proyectada",
+                                 "Resultado demanda": "¿Cumple demanda?"}),
                              use_container_width=True, hide_index=True)
                 orden = ["1-15 días", "16-30 días", "31-45 días", "46-60 días",
                          "61-75 días", ">75 días"]
@@ -3170,18 +3259,28 @@ def pagina_control():
     if "Acción de compra" not in datos.columns:
         st.info("Falta el TAT o el pronóstico para calcular la planificación.")
     else:
-        plan = datos[datos["Acción de compra"].isin(
+        # Solo materiales SIN gestión activa: se excluyen los que ya tienen una OC
+        # o una solped en curso (esos ya se están gestionando). Sí se incluyen los
+        # que están en validación o con solped bloqueada (necesitan destrabarse) y
+        # los que no tienen ninguna gestión.
+        gestion_ok = datos["Estado gestión"].isin(
+            ["Sin gestión", "Validación", "Solped bloqueada"])
+        base_plan = datos[gestion_ok]
+        st.caption("ℹ️ Se excluyen los materiales que **ya tienen OC o solped en curso** "
+                   "(ya se están gestionando). Se incluyen los **sin gestión**, en "
+                   "**validación** o con **solped bloqueada**.")
+        plan = base_plan[base_plan["Acción de compra"].isin(
             ["Pedir ya (gestionar con urgencia)",
              "Gestionar solicitud para cumplir plazos"])
-            | datos["Acción de compra"].astype(str).str.startswith("Pedir en")]
-        # KPIs de planificación
+            | base_plan["Acción de compra"].astype(str).str.startswith("Pedir en")]
+        # KPIs de planificación (sobre los materiales sin gestión activa)
         pk = st.columns(3)
         pk[0].metric("🔴 Pedir ya",
-                     int((datos["Acción de compra"] == "Pedir ya (gestionar con urgencia)").sum()))
+                     int((base_plan["Acción de compra"] == "Pedir ya (gestionar con urgencia)").sum()))
         pk[1].metric("🟠 Gestionar solicitud",
-                     int((datos["Acción de compra"] == "Gestionar solicitud para cumplir plazos").sum()))
+                     int((base_plan["Acción de compra"] == "Gestionar solicitud para cumplir plazos").sum()))
         pk[2].metric("🟢 Pedir más adelante",
-                     int(datos["Acción de compra"].astype(str).str.startswith("Pedir en").sum()))
+                     int(base_plan["Acción de compra"].astype(str).str.startswith("Pedir en").sum()))
 
         if plan.empty:
             st.success("Ningún material requiere gestión de compra por TAT en este momento.")
