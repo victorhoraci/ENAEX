@@ -1076,6 +1076,12 @@ def resultado_final(
     final["Tiempo_hasta_demanda"] = tiempos[0]
     final["Dias_hasta_demanda"] = tiempos[1]
 
+    # --- Desviación estándar de la demanda (para calcular stock de seguridad) ---
+    if "DesvEst_demandas_positivas" in clasificacion.columns:
+        desv = clasificacion[["Material", "Centro", "DesvEst_demandas_positivas"]].rename(
+            columns={"DesvEst_demandas_positivas": "Desviacion estandar demanda"})
+        final = final.merge(desv, on=["Material", "Centro"], how="left")
+
     return final.sort_values(["Material", "Centro"]).reset_index(drop=True)
 
 # ==========================================================================
@@ -2020,6 +2026,248 @@ def _unir_demanda(base: pd.DataFrame) -> pd.DataFrame:
             return "Gestionar normal"
         base["Urgencia OC"] = [_urgencia_oc(dd, tt) for dd, tt in zip(dias_dem, tat)]
     return base
+
+
+# ========================================================================
+#  PARÁMETROS DE INVENTARIO (Stock Seguridad · ROP · Lote)
+# ========================================================================
+# Parámetros del modelo (idénticos al Power Query)
+Z = 0.84                 # factor de servicio para 80%
+DIAS_POR_MES = 30
+PISO_NACIONAL = 60       # días de lead time mínimo para materiales nacionales
+PISO_INTERNAC = 100      # días para internacionales / otros
+
+
+def _ss(dem, sigma_d, lt, sigma_L):
+    """Stock de seguridad. Si falta lead time o historial -> SS = demanda."""
+    dem = 0 if pd.isna(dem) else float(dem)
+    sd = 0 if pd.isna(sigma_d) else float(sigma_d)
+    sl = 0 if pd.isna(sigma_L) else float(sigma_L)
+    sin_lt = pd.isna(lt) or lt in (0, None) or lt == 0
+    sin_hist = pd.isna(sigma_d) or sd == 0
+    if sin_lt or sin_hist:
+        return math.ceil(dem)
+    ltv = float(lt)
+    c1 = ltv * sd * sd
+    c2 = dem * dem * sl * sl
+    r = Z * math.sqrt(c1 + c2) if (c1 + c2) > 0 else 0
+    return math.ceil(r)
+
+
+def _ss_conservador(dem, sigma_d, lt60, sigma_L):
+    """SS del escenario conservador: solo exige historial (el LT siempre existe)."""
+    dem = 0 if pd.isna(dem) else float(dem)
+    sd = 0 if pd.isna(sigma_d) else float(sigma_d)
+    sl = 0 if pd.isna(sigma_L) else float(sigma_L)
+    sin_hist = pd.isna(sigma_d) or sd == 0
+    if sin_hist:
+        return math.ceil(dem)
+    lt = float(lt60)
+    c1 = lt * sd * sd
+    c2 = dem * dem * sl * sl
+    r = Z * math.sqrt(c1 + c2) if (c1 + c2) > 0 else 0
+    return math.ceil(r)
+
+
+def _rop(dem, lt, ss):
+    dem = 0 if pd.isna(dem) else float(dem)
+    lt = 0 if pd.isna(lt) else float(lt)
+    return math.ceil(dem * lt + ss)
+
+
+def _motivo(lt_real, sigma_d):
+    sin_lt = pd.isna(lt_real) or lt_real == 0
+    sin_hist = pd.isna(sigma_d) or sigma_d == 0
+    if sin_lt and sin_hist:
+        return "SS = Demanda (sin LT ni historial)"
+    if sin_lt:
+        return "SS = Demanda (sin lead time)"
+    if sin_hist:
+        return "SS = Demanda (sin historial)"
+    return "Fórmula completa"
+
+
+def calcular_parametros(demanda_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Calcula SS, ROP y lote para todos los materiales con demanda.
+
+    demanda_df: tabla de ResultadoFinal del pipeline (si es None se calcula).
+                Debe tener: Material, Centro, Tipo_demanda, Pronostico_Consolidado
+                (o 'Pronostico consolidado'), Desviacion estandar demanda,
+                PR_Media_Intervalo.
+    """
+    # --- Demanda (del pipeline de pronóstico) ---
+    if demanda_df is None:
+        demanda_df = construir().resultado.copy()
+    dem = demanda_df.copy()
+    dem["Material"] = _norm_codigo(dem["Material"])
+
+    # Pronóstico consolidado: nombre puede variar
+    col_pron = next((c for c in ["Pronostico consolidado", "Pronostico_Consolidado",
+                                 "Pronostico_redondeado"] if c in dem.columns), None)
+    col_sigma = next((c for c in ["Desviacion estandar demanda", "Desviacion_estandar_demanda",
+                                  "DesviacionDemanda"] if c in dem.columns), None)
+    if col_pron is None:
+        # construir el consolidado si no viene
+        dem["d"] = dem.get("Pronostico_redondeado")
+    else:
+        dem["d"] = pd.to_numeric(dem[col_pron], errors="coerce")
+    dem["sigma_d"] = pd.to_numeric(dem[col_sigma], errors="coerce") if col_sigma else np.nan
+    inter = dem["PR_Media_Intervalo"] if "PR_Media_Intervalo" in dem.columns else np.nan
+
+    base = pd.DataFrame({
+        "Material": dem["Material"],
+        "Centro": dem.get("Centro"),
+        "Tipo_demanda": dem.get("Tipo_demanda"),
+        "d": dem["d"],
+        "sigma_d": dem["sigma_d"],
+        "PR_Media_Intervalo": inter,
+    })
+
+    # --- MM60: ABC, precio, nacionalidad ---
+    try:
+        m60 = cargar_mm60()
+        cols_m = {"Material": "Material", "Centro": "Centro"}
+        base = base.merge(
+            m60.rename(columns={"Indicador ABC": "ABC", "Precio": "Precio",
+                                "Tipo de material": "TipoMat"}),
+            on="Material", how="left", suffixes=("", "_m60"))
+    except Exception:
+        base["ABC"] = np.nan
+        base["Precio"] = np.nan
+
+    # Nacionalidad para el piso de lead time: se toma de la clasificación por OC
+    # (si MM60 no la trae, se asume Nacional -> piso 60).
+    if "Nacional" not in base.columns:
+        base["EsNacional"] = True  # por defecto nacional (piso 60)
+
+    # --- TAT (lead time real y su desviación) ---
+    try:
+        tat = cargar_tat()
+        tat = tat.rename(columns={"TAT Promedio": "TAT_Prom", "TAT Std": "TAT_Std"})
+        cols_t = [c for c in ["Material", "TAT_Prom", "TAT_Std"] if c in tat.columns]
+        base = base.merge(tat[cols_t], on="Material", how="left")
+    except Exception:
+        base["TAT_Prom"] = np.nan
+        base["TAT_Std"] = np.nan
+
+    # --- Piso de lead time según nacionalidad ---
+    def _piso(nac):
+        return PISO_NACIONAL if nac else PISO_INTERNAC
+    base["L_Piso_Dias"] = base["EsNacional"].apply(_piso) if "EsNacional" in base.columns else PISO_NACIONAL
+
+    # L_60 (días): mayor entre el piso y el TAT real; si no hay TAT, el piso
+    def _l60_dias(row):
+        piso = row["L_Piso_Dias"]
+        prom = row.get("TAT_Prom")
+        if pd.isna(prom) or prom < piso:
+            return piso
+        return prom
+    base["L_60_dias"] = base.apply(_l60_dias, axis=1)
+
+    # Conversión a meses
+    base["L_real"] = base["TAT_Prom"] / DIAS_POR_MES         # puede ser NaN
+    base["L_60"] = base["L_60_dias"] / DIAS_POR_MES
+    base["sigma_L"] = base["TAT_Std"] / DIAS_POR_MES          # desv del LT en meses
+
+    # --- Escenario real ---
+    base["SS"] = [
+        _ss(d, sd, lr, sl)
+        for d, sd, lr, sl in zip(base["d"], base["sigma_d"], base["L_real"], base["sigma_L"])
+    ]
+    base["ROP"] = [_rop(d, lr, ss) for d, lr, ss in zip(base["d"], base["L_real"], base["SS"])]
+
+    # --- Escenario conservador (piso 60/100) ---
+    base["SS_60"] = [
+        _ss_conservador(d, sd, l60, sl)
+        for d, sd, l60, sl in zip(base["d"], base["sigma_d"], base["L_60"], base["sigma_L"])
+    ]
+    base["ROP_60"] = [_rop(d, l60, ss) for d, l60, ss in zip(base["d"], base["L_60"], base["SS_60"])]
+
+    base["Diferencia_ROP"] = base["ROP_60"] - base["ROP"]
+    base["Motivo_SS"] = [_motivo(lr, sd) for lr, sd in zip(base["L_real"], base["sigma_d"])]
+
+    # TAT en días (para mostrar)
+    base["TAT_Real_Dias"] = (base["L_real"] * DIAS_POR_MES).round(1)
+    base["TAT_Conservador_Dias"] = (base["L_60"] * DIAS_POR_MES).round(1)
+
+    # --- Cobertura y lote de compra ---
+    base["Meses_Cobertura_Base"] = np.where(base["ABC"].astype(str).str.upper() == "A", 12, 6)
+
+    def _cobertura_real(row):
+        base_m = row["Meses_Cobertura_Base"]
+        inter = row.get("PR_Media_Intervalo")
+        if pd.notna(inter) and inter > 0:
+            return round(base_m / inter, 2)
+        return base_m
+    base["Meses_Cobertura_Real"] = base.apply(_cobertura_real, axis=1)
+
+    def _lote(row):
+        dem_v = 0 if pd.isna(row["d"]) else row["d"]
+        inter = row.get("PR_Media_Intervalo")
+        tipo = row.get("Tipo_demanda")
+        if pd.isna(inter) and tipo == "Intermitente":
+            lote = row["SS_60"]
+        elif pd.notna(inter) and inter > 12:
+            lote = row["ROP_60"]
+        else:
+            lote = dem_v * row["Meses_Cobertura_Real"]
+        return math.ceil(lote) if pd.notna(lote) else 0
+    base["Lote_Compra"] = base.apply(_lote, axis=1)
+
+    return base.reset_index(drop=True)
+
+
+def parametros_vs_mrp(mrp_df: pd.DataFrame | None = None,
+                      params: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Cruza los parámetros calculados con los del MRP actual (Stock Seguridad y
+    Lote de compra vigentes) para ver diferencias y materiales desactualizados.
+
+    Compara el punto de reorden conservador (ROP_60) con el stock de seguridad
+    que aparece hoy en el MRP: dice si el nuevo parámetro SUBE o BAJA.
+    """
+    if params is None:
+        params = calcular_parametros()
+    if mrp_df is None:
+        mrp_df = cargar_mrp()
+    mrp = mrp_df.drop_duplicates(subset=["Material", "Centro"], keep="last").copy()
+    mrp["Material"] = _norm_codigo(mrp["Material"])
+
+    cols_mrp = {"Material": "Material", "Centro": "Centro",
+                "Stock Seguridad": "SS_MRP", "Cantidad de Compra": "Lote_MRP",
+                "Stock": "Stock_actual", "Texto breve de material": "Descripción",
+                "Area": "Area", "Criticidad": "Criticidad"}
+    disponibles = {k: v for k, v in cols_mrp.items() if k in mrp.columns}
+    m = mrp[list(disponibles.keys())].rename(columns=disponibles)
+
+    out = params.merge(m, on=["Material", "Centro"], how="left")
+
+    # ¿El nuevo parámetro sube o baja respecto al stock de seguridad del MRP?
+    def _cambio(row):
+        nuevo = row.get("ROP_60")
+        actual = row.get("SS_MRP")
+        if pd.isna(nuevo) or pd.isna(actual):
+            return "Sin comparación"
+        if nuevo > actual:
+            return "Sube"
+        if nuevo < actual:
+            return "Baja"
+        return "Igual"
+    out["Cambio ROP vs SS-MRP"] = out.apply(_cambio, axis=1)
+    out["Dif ROP - SS MRP"] = pd.to_numeric(out.get("ROP_60"), errors="coerce") - \
+        pd.to_numeric(out.get("SS_MRP"), errors="coerce")
+
+    # ¿Está desactualizado? (el SS del MRP difiere del SS calculado)
+    def _desactualizado(row):
+        ss_calc = row.get("SS_60")
+        ss_mrp = row.get("SS_MRP")
+        if pd.isna(ss_calc) or pd.isna(ss_mrp):
+            return "Sin dato"
+        return "Desactualizado" if ss_calc != ss_mrp else "Al día"
+    out["Estado parámetro"] = out.apply(_desactualizado, axis=1)
+
+    return out.reset_index(drop=True)
 
 
 # ========================================================================
@@ -3716,6 +3964,144 @@ def pagina_costos():
 
 
 # ==========================================================================
+#  PÁGINA · PARÁMETROS DE INVENTARIO (SS, ROP, Lote)
+# ==========================================================================
+@st.cache_data(show_spinner="Calculando parámetros de inventario…")
+def cargar_parametros():
+    return parametros_vs_mrp()
+
+
+def pagina_parametros():
+    st.markdown(
+        '<div class="hdr hdr-ambar"><h1>🎛️ Parámetros de inventario</h1>'
+        '<p>Nuevo stock de seguridad, punto de reorden y lote de compra sugeridos</p></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Calcula los parámetros teóricos con la demanda proyectada, la "
+               "variabilidad y el tiempo de abastecimiento (TAT), y los compara con "
+               "los del MRP actual. Nivel de servicio 80% (Z=0.84).")
+
+    try:
+        p = cargar_parametros()
+    except Exception as e:
+        st.error(f"No se pudieron calcular los parámetros: {e}")
+        tabla_estado_archivos(expandido=True)
+        return
+
+    if p.empty:
+        st.warning("No hay materiales con demanda para calcular parámetros.")
+        return
+
+    # Filtros
+    with st.sidebar:
+        st.markdown("### Filtros")
+        f_abc = filtro_multi(p, "ABC", "Clasificación ABC", "par_abc")
+        f_tipo = filtro_multi(p, "Tipo_demanda", "Tipo de demanda", "par_tipo")
+        f_estado = filtro_multi(p, "Estado parámetro", "Estado del parámetro", "par_est")
+        f_cambio = filtro_multi(p, "Cambio ROP vs SS-MRP", "Cambio ROP vs SS-MRP", "par_camb")
+        if st.button("🔄 Recalcular", key="rec_par"):
+            st.cache_data.clear()
+            st.rerun()
+
+    datos = p.copy()
+    for col, sel in [("ABC", f_abc), ("Tipo_demanda", f_tipo),
+                     ("Estado parámetro", f_estado), ("Cambio ROP vs SS-MRP", f_cambio)]:
+        datos = aplicar_filtro(datos, col, sel)
+
+    if datos.empty:
+        st.warning("Ningún material coincide con los filtros.")
+        return
+
+    # ---------------- KPIs ----------------
+    desact = int((datos["Estado parámetro"] == "Desactualizado").sum())
+    sube = int((datos["Cambio ROP vs SS-MRP"] == "Sube").sum())
+    baja = int((datos["Cambio ROP vs SS-MRP"] == "Baja").sum())
+    k = st.columns(4)
+    k[0].metric("Materiales", f"{len(datos):,}".replace(",", "."))
+    k[1].metric("Desactualizados", desact,
+                help="El stock de seguridad del MRP difiere del calculado")
+    k[2].metric("ROP sube vs SS-MRP", sube,
+                help="El nuevo punto de reorden es mayor que el stock de seguridad actual")
+    k[3].metric("ROP baja vs SS-MRP", baja,
+                help="El nuevo punto de reorden es menor que el stock de seguridad actual")
+
+    st.markdown("---")
+
+    # ---------------- Gráficos ----------------
+    g1, g2 = st.columns(2)
+    with g1:
+        conteo = {"Desactualizado": desact,
+                  "Al día": int((datos["Estado parámetro"] == "Al día").sum())}
+        st.plotly_chart(barras(conteo,
+                               {"Desactualizado": "#E74C3C", "Al día": "#27AE60"},
+                               "Materiales desactualizados vs al día"),
+                        use_container_width=True)
+    with g2:
+        orden = ["Sube", "Baja", "Igual", "Sin comparación"]
+        conteo = {o: int((datos["Cambio ROP vs SS-MRP"] == o).sum()) for o in orden}
+        conteo = {a: b for a, b in conteo.items() if b}
+        st.plotly_chart(barras(conteo,
+                               {"Sube": "#E67E22", "Baja": "#2E86DE",
+                                "Igual": "#95A5A6", "Sin comparación": "#BDC3C7"},
+                               "ROP nuevo vs Stock Seguridad del MRP"),
+                        use_container_width=True)
+
+    st.markdown("---")
+
+    # ---------------- Ficha individual ----------------
+    st.markdown("#### Ver un material en detalle")
+    datos["etiqueta"] = (datos["Material"].astype(str) + "  —  "
+                         + datos.get("Descripción", pd.Series("", index=datos.index)).fillna(""))
+    etiqueta = st.selectbox("Buscar material", ["(ninguno)"] + sorted(datos["etiqueta"]),
+                            key="par_buscar")
+    if etiqueta != "(ninguno)":
+        info = datos[datos["Material"] == etiqueta.split("  —  ")[0].strip()].iloc[0]
+        st.markdown(f"### {info.get('Descripción', '')}")
+        c = st.columns(4)
+        c[0].metric("Tipo de demanda", str(info.get("Tipo_demanda", "—")))
+        c[1].metric("Demanda esperada", "—" if pd.isna(info.get("d")) else f"{info['d']:.0f}")
+        c[2].metric("Clasificación ABC", str(info.get("ABC", "—")))
+        c[3].metric("TAT real", "—" if pd.isna(info.get("TAT_Real_Dias")) else f"{info['TAT_Real_Dias']:.0f} días")
+
+        st.markdown("**Parámetros sugeridos (escenario conservador con piso 60/100)**")
+        c = st.columns(3)
+        c[0].metric("Stock de seguridad", f"{info.get('SS_60', '—')}",
+                    help=f"Escenario real: {info.get('SS', '—')}")
+        c[1].metric("Punto de reorden", f"{info.get('ROP_60', '—')}",
+                    help=f"Escenario real: {info.get('ROP', '—')}")
+        c[2].metric("Lote de compra", f"{info.get('Lote_Compra', '—')}")
+
+        st.markdown("**Comparación con el MRP actual**")
+        c = st.columns(4)
+        c[0].metric("SS en el MRP", "—" if pd.isna(info.get("SS_MRP")) else f"{info['SS_MRP']:.0f}")
+        c[1].metric("Lote en el MRP", "—" if pd.isna(info.get("Lote_MRP")) else f"{info['Lote_MRP']:.0f}")
+        c[2].metric("Estado", str(info.get("Estado parámetro", "—")))
+        c[3].metric("ROP vs SS-MRP", str(info.get("Cambio ROP vs SS-MRP", "—")))
+        st.caption(f"Motivo del cálculo de SS: {info.get('Motivo_SS', '—')}")
+
+    st.markdown("---")
+
+    # ---------------- Tabla completa ----------------
+    st.markdown("#### Todos los materiales")
+    cols = [c for c in ["Material", "Descripción", "ABC", "Tipo_demanda", "d",
+                        "TAT_Real_Dias", "SS", "ROP", "SS_60", "ROP_60", "Lote_Compra",
+                        "SS_MRP", "Lote_MRP", "Estado parámetro", "Cambio ROP vs SS-MRP",
+                        "Dif ROP - SS MRP", "Motivo_SS"] if c in datos.columns]
+    vista = datos[cols].rename(columns={
+        "d": "Demanda esperada", "TAT_Real_Dias": "TAT real (días)",
+        "SS": "SS real", "ROP": "ROP real", "SS_60": "SS sugerido",
+        "ROP_60": "ROP sugerido", "Lote_Compra": "Lote sugerido",
+        "SS_MRP": "SS actual (MRP)", "Lote_MRP": "Lote actual (MRP)",
+        "Dif ROP - SS MRP": "Diferencia"}).sort_values("Material")
+    vista = buscar_en_tabla(vista, "buscar_par", cols=("Material", "Descripción"))
+    st.dataframe(vista, use_container_width=True, hide_index=True)
+    st.download_button("⬇️  Descargar parámetros (CSV)",
+                       data=vista.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="parametros_inventario.csv", mime="text/csv",
+                       key="dl_par")
+
+
+# ==========================================================================
 #  PÁGINA · CARGAR ARCHIVOS
 # ==========================================================================
 def pagina_cargar():
@@ -3894,6 +4280,7 @@ PAGINAS = {
     "🎯  Control de Materiales": pagina_control,
     "🚚  MRP E002": pagina_mrp_e002,
     "💰  Costos": pagina_costos,
+    "🎛️  Parámetros de inventario": pagina_parametros,
     "📈  Demanda y Pronóstico": pagina_demanda,
     "📥  Cargar archivos": pagina_cargar,
     "📖  Cómo usar": pagina_ayuda,
