@@ -1843,6 +1843,19 @@ def construir_abastecimiento(
     # --- Conexión con la DEMANDA (panel 1): pronóstico, tiempo y Cumple_Demanda ---
     base = _unir_demanda(base)
 
+    # Garantizar que las columnas derivadas de la demanda SIEMPRE existan,
+    # aunque el cruce con la demanda haya fallado (así la interfaz nunca se rompe
+    # buscando una columna que no está).
+    for col, defecto in [
+        ("Tipo_demanda", pd.NA), ("Pronostico_Consolidado", pd.NA),
+        ("Tiempo_Prox_Demanda", pd.NA), ("Cumple_Demanda", "Sin pronóstico"),
+        ("Stock tras demanda", pd.NA), ("Resultado demanda", "Sin pronóstico"),
+        ("Acción de compra", "Sin pronóstico"), ("Holgura días (demanda - TAT)", pd.NA),
+        ("Urgencia OC", "Sin dato TAT"),
+    ]:
+        if col not in base.columns:
+            base[col] = defecto
+
     # --- KPIs ---
     total = len(base)
     quiebre = int((base["Condicion Stock"] == "Quiebre Stock").sum()) if "Condicion Stock" in base.columns else 0
@@ -2781,53 +2794,63 @@ def pagina_mrp_e002():
             st.caption("Incluye el TAT, el tiempo hasta la demanda y si es crítico "
                        "convertirla en OC (según TAT vs demanda).")
             sol = datos[datos["Estado gestión"] == "Con Solped"]
-            cols_s = [c for c in ["Material", "Texto breve de material", "Solped",
-                                  "Días en solped", "TAT Promedio", "Tiempo demanda (días)",
-                                  "Urgencia OC", "Condicion Stock", "Criticidad texto"]
-                      if c in sol.columns]
             if sol.empty:
                 st.info("No hay materiales con solped en curso.")
             else:
-                orden_u = {"Urgente (TAT supera la demanda)": 0, "Urgente": 1,
-                           "Agilizar": 2, "Gestionar normal": 3}
-                sol_v = sol[cols_s].assign(
-                    _o=sol["Urgencia OC"].map(lambda x: orden_u.get(x, 4)).values
-                ).sort_values(["_o", "Días en solped"], ascending=[True, False]).drop(columns="_o")
+                cols_s = [c for c in ["Material", "Texto breve de material", "Solped",
+                                      "Días en solped", "TAT Promedio", "Tiempo demanda (días)",
+                                      "Urgencia OC", "Condicion Stock", "Criticidad texto"]
+                          if c in sol.columns]
+                sol_v = sol[cols_s].copy()
+                # Ordenar por urgencia si la columna existe; si no, por días en solped
+                if "Urgencia OC" in sol_v.columns:
+                    orden_u = {"Urgente (TAT supera la demanda)": 0, "Urgente": 1,
+                               "Agilizar": 2, "Gestionar normal": 3}
+                    sol_v["_o"] = sol_v["Urgencia OC"].map(lambda x: orden_u.get(x, 4))
+                    ordenar = ["_o"] + (["Días en solped"] if "Días en solped" in sol_v.columns else [])
+                    asc = [True] + ([False] if "Días en solped" in sol_v.columns else [])
+                    sol_v = sol_v.sort_values(ordenar, ascending=asc).drop(columns="_o")
+                elif "Días en solped" in sol_v.columns:
+                    sol_v = sol_v.sort_values("Días en solped", ascending=False)
                 st.dataframe(sol_v.rename(columns={
                     "Texto breve de material": "Descripción",
                     "TAT Promedio": "TAT (días)",
                     "Urgencia OC": "¿Crítico hacer OC?"}),
                     use_container_width=True, hide_index=True)
-                orden = ["0-10 días", "11-20 días", "21-30 días", "31+ días"]
-                conteo = {o: int((sol["Rango días solped"] == o).sum()) for o in orden}
-                st.plotly_chart(barras(conteo, {}, "Antigüedad de las solped", True),
-                                use_container_width=True)
+                if "Rango días solped" in sol.columns:
+                    orden = ["0-10 días", "11-20 días", "21-30 días", "31+ días"]
+                    conteo = {o: int((sol["Rango días solped"] == o).sum()) for o in orden}
+                    st.plotly_chart(barras(conteo, {}, "Antigüedad de las solped", True),
+                                    use_container_width=True)
         with c2:
             st.markdown("##### 🚚 OC en tránsito (con días y atraso)")
             st.caption("Incluye la próxima demanda, el stock actual, el tiempo hasta "
                        "la demanda y si el stock la cubre o no.")
             oc = datos[datos["Estado OC"].isin(["Atrasada", "En curso"])]
-            cols_o = [c for c in ["Material", "Texto breve de material", "OC en Transito",
-                                  "Nacionalidad", "Estado OC", "Días de OC", "Días atraso OC",
-                                  "Stock", "Pronostico_Consolidado", "Tiempo demanda (días)",
-                                  "Resultado demanda", "Proveedor"]
-                      if c in oc.columns]
             if oc.empty:
                 st.info("No hay OC en tránsito.")
             else:
-                st.dataframe(oc[cols_o].sort_values("Días atraso OC", ascending=False)
-                             .rename(columns={
-                                 "Texto breve de material": "Descripción",
-                                 "Pronostico_Consolidado": "Demanda proyectada",
-                                 "Resultado demanda": "¿Cumple demanda?"}),
-                             use_container_width=True, hide_index=True)
-                orden = ["1-15 días", "16-30 días", "31-45 días", "46-60 días",
-                         "61-75 días", ">75 días"]
-                conteo = {o: int((oc["Rango atraso OC"] == o).sum()) for o in orden}
-                conteo = {a: b for a, b in conteo.items() if b}
-                if conteo:
-                    st.plotly_chart(barras(conteo, {}, "Atraso de las OC", True),
-                                    use_container_width=True)
+                cols_o = [c for c in ["Material", "Texto breve de material", "OC en Transito",
+                                      "Nacionalidad", "Estado OC", "Días de OC", "Días atraso OC",
+                                      "Stock", "Pronostico_Consolidado", "Tiempo demanda (días)",
+                                      "Resultado demanda", "Proveedor"]
+                          if c in oc.columns]
+                oc_v = oc[cols_o].copy()
+                if "Días atraso OC" in oc_v.columns:
+                    oc_v = oc_v.sort_values("Días atraso OC", ascending=False)
+                st.dataframe(oc_v.rename(columns={
+                    "Texto breve de material": "Descripción",
+                    "Pronostico_Consolidado": "Demanda proyectada",
+                    "Resultado demanda": "¿Cumple demanda?"}),
+                    use_container_width=True, hide_index=True)
+                if "Rango atraso OC" in oc.columns:
+                    orden = ["1-15 días", "16-30 días", "31-45 días", "46-60 días",
+                             "61-75 días", ">75 días"]
+                    conteo = {o: int((oc["Rango atraso OC"] == o).sum()) for o in orden}
+                    conteo = {a: b for a, b in conteo.items() if b}
+                    if conteo:
+                        st.plotly_chart(barras(conteo, {}, "Atraso de las OC", True),
+                                        use_container_width=True)
 
         st.markdown("---")
         st.markdown("##### 🌎 OC nacionales vs internacionales")
