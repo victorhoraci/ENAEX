@@ -1457,6 +1457,16 @@ def historial_semanal(mrp=None) -> pd.DataFrame:
     disponibilidad de los materiales críticos (A).
     """
     todas = cargar_mrp(mrp)
+    # Traer el precio de MM60 para valorizar el stock de cada semana
+    precios = None
+    try:
+        m60 = cargar_mm60()
+        if "Precio" in m60.columns:
+            precios = m60[["Material", "Centro", "Precio"]].drop_duplicates(
+                subset=["Material", "Centro"])
+    except Exception:
+        precios = None
+
     filas = []
     for semana, g in todas.groupby("Semana", sort=True):
         g = g.drop_duplicates(subset=["Material", "Centro"], keep="last")
@@ -1486,6 +1496,24 @@ def historial_semanal(mrp=None) -> pd.DataFrame:
             if len(crit):
                 q = int((crit["Condicion Stock"] == "Quiebre Stock").sum())
                 fila["Disponibilidad A"] = round(100 * (len(crit) - q) / len(crit), 2)
+
+        # --- Valorización de la semana (si hay precios de MM60) ---
+        if precios is not None:
+            gp = g.merge(precios, on=["Material", "Centro"], how="left")
+            precio = pd.to_numeric(gp["Precio"], errors="coerce")
+            stock = pd.to_numeric(gp["Stock"], errors="coerce")
+            transito = pd.to_numeric(gp.get("Cantidad en Transito"), errors="coerce").fillna(0) \
+                if "Cantidad en Transito" in gp.columns else 0
+            valor_stock = precio * stock
+            fila["Valor stock"] = round(float(valor_stock.sum(skipna=True)), 0)
+            fila["Valor en tránsito"] = round(float((precio * transito).sum(skipna=True)), 0)
+            if "Condicion Stock" in gp.columns:
+                sobre = valor_stock[gp["Condicion Stock"] == "Sobre Stock"].sum(skipna=True)
+                bajo = valor_stock[gp["Condicion Stock"] == "Bajo Stock"].sum(skipna=True)
+                okv = valor_stock[gp["Condicion Stock"] == "Stock OK"].sum(skipna=True)
+                fila["Valor sobre stock"] = round(float(sobre), 0)
+                fila["Valor bajo stock"] = round(float(bajo), 0)
+                fila["Valor stock OK"] = round(float(okv), 0)
         filas.append(fila)
 
     hist = pd.DataFrame(filas)
@@ -2304,6 +2332,31 @@ def aplicar_filtro(datos, col, seleccion):
     return datos[mask]
 
 
+def buscar_en_tabla(df, key, etiqueta="🔎 Buscar material (código o nombre)",
+                    cols=("Material", "Texto breve de material", "Descripción")):
+    """
+    Caja de búsqueda arriba de una tabla: filtra las filas cuyo código o nombre
+    contengan el texto escrito. Devuelve el DataFrame filtrado.
+    Busca en las columnas indicadas que existan en el df.
+    """
+    texto = st.text_input(etiqueta, key=key, placeholder="Ej: 20004806 o VALVULA")
+    if not texto or not texto.strip():
+        return df
+    t = texto.strip().lower()
+    cols_busca = [c for c in cols if c in df.columns]
+    if not cols_busca:
+        return df
+    mask = pd.Series(False, index=df.index)
+    for c in cols_busca:
+        mask = mask | df[c].astype(str).str.lower().str.contains(t, na=False, regex=False)
+    filtrado = df[mask]
+    if filtrado.empty:
+        st.caption(f"Sin resultados para «{texto}».")
+    else:
+        st.caption(f"{len(filtrado)} resultado(s) para «{texto}».")
+    return filtrado
+
+
 def _card(lbl, val, sub=""):
     return (f'<div class="metric-card"><div class="lbl">{lbl}</div>'
             f'<div class="val">{val}</div><div class="sub">{sub}</div></div>')
@@ -2801,6 +2854,7 @@ def pagina_mrp_e002():
                                       "Días en solped", "TAT Promedio", "Tiempo demanda (días)",
                                       "Urgencia OC", "Condicion Stock", "Criticidad texto"]
                           if c in sol.columns]
+                sol = buscar_en_tabla(sol, "buscar_sol")
                 sol_v = sol[cols_s].copy()
                 # Ordenar por urgencia si la columna existe; si no, por días en solped
                 if "Urgencia OC" in sol_v.columns:
@@ -2835,6 +2889,7 @@ def pagina_mrp_e002():
                                       "Stock", "Pronostico_Consolidado", "Tiempo demanda (días)",
                                       "Resultado demanda", "Proveedor"]
                           if c in oc.columns]
+                oc = buscar_en_tabla(oc, "buscar_oc")
                 oc_v = oc[cols_o].copy()
                 if "Días atraso OC" in oc_v.columns:
                     oc_v = oc_v.sort_values("Días atraso OC", ascending=False)
@@ -3092,6 +3147,7 @@ def pagina_mrp_e002():
             st.markdown("---")
 
         vista = datos.drop(columns=["etiqueta"], errors="ignore").sort_values("Material")
+        vista = buscar_en_tabla(vista, "buscar_ab_todos")
         st.dataframe(vista, use_container_width=True, hide_index=True)
         st.download_button("⬇️  Descargar tabla completa (CSV)",
                            data=vista.to_csv(index=False).encode("utf-8-sig"),
@@ -3256,6 +3312,7 @@ def pagina_control():
         orden_urg = {"No cumple": 0, "Urgente": 1, "Alerta": 2}
         vista_c = vista_c.assign(_o=criticos["Resultado demanda"].map(orden_urg).values) \
                          .sort_values(["_o", "Descripción"]).drop(columns="_o")
+        vista_c = buscar_en_tabla(vista_c, "buscar_ctl_crit")
         st.dataframe(vista_c, use_container_width=True, hide_index=True)
         st.download_button("⬇️  Descargar materiales críticos (CSV)",
                            data=vista_c.to_csv(index=False).encode("utf-8-sig"),
@@ -3328,6 +3385,7 @@ def pagina_control():
             vista_p = vista_p.assign(
                 _o=plan["Acción de compra"].map(lambda x: orden_acc.get(x, 2)).values
             ).sort_values(["_o", "Holgura (días)"]).drop(columns="_o")
+            vista_p = buscar_en_tabla(vista_p, "buscar_ctl_plan")
             st.dataframe(vista_p, use_container_width=True, hide_index=True)
             st.download_button("⬇️  Descargar planificación de compra (CSV)",
                                data=vista_p.to_csv(index=False).encode("utf-8-sig"),
@@ -3415,6 +3473,7 @@ def pagina_control():
                "pronóstico, la celda queda vacía.")
     cols = [c for c in COLS_CONTROL if c in datos.columns]
     vista = datos[cols].rename(columns=RENOMBRE_CONTROL).sort_values("Material")
+    vista = buscar_en_tabla(vista, "buscar_ctl_todos")
     st.dataframe(vista, use_container_width=True, hide_index=True)
     st.download_button("⬇️  Descargar tabla (CSV)",
                        data=vista.to_csv(index=False).encode("utf-8-sig"),
@@ -3551,6 +3610,72 @@ def pagina_costos():
 
     st.markdown("---")
 
+    # ---------------- Evolución histórica de costos ----------------
+    st.markdown("#### 📈 Evolución de costos por semana")
+    st.caption("Usa todos los MRP históricos cargados. Cada semana nueva agrega un punto.")
+    try:
+        hist = cargar_historial()
+    except Exception:
+        hist = pd.DataFrame()
+
+    if hist.empty or "Valor stock" not in hist.columns:
+        st.info("Se necesita el histórico semanal del MRP y el precio (MM60) para la evolución.")
+    elif len(hist) == 1:
+        st.info(f"Solo hay 1 semana cargada ({hist['Semana'].iloc[0]}). "
+                "Sube más MRP semanales para ver la evolución de costos.")
+    else:
+        def linea_costo(cols, titulo):
+            colores = {"Valor stock": "#B9770E", "Valor sobre stock": "#2E86DE",
+                       "Valor bajo stock": "#F39C12", "Valor stock OK": "#27AE60",
+                       "Valor en tránsito": "#8E44AD"}
+            fig = go.Figure()
+            for c in cols:
+                if c in hist.columns:
+                    fig.add_trace(go.Scatter(
+                        x=hist["Semana"], y=hist[c], name=c, mode="lines+markers",
+                        line=dict(width=2.5, color=colores.get(c)), marker=dict(size=7),
+                        hovertemplate="%{x}<br>%{y:$,.0f}<extra>" + c + "</extra>"))
+            fig.update_layout(title=titulo, height=320,
+                              margin=dict(l=10, r=10, t=45, b=10),
+                              plot_bgcolor="#fff", paper_bgcolor="#fff", hovermode="x unified",
+                              legend=dict(orientation="h", y=1.02, yanchor="bottom"),
+                              xaxis=dict(title="", showgrid=False),
+                              yaxis=dict(title="CLP", showgrid=True, gridcolor="#EEF1F4"))
+            return fig
+
+        e1, e2 = st.columns(2)
+        with e1:
+            st.plotly_chart(linea_costo(["Valor stock"],
+                                        "Valor total del stock en bodega"),
+                            use_container_width=True)
+        with e2:
+            st.plotly_chart(linea_costo(["Valor sobre stock", "Valor bajo stock", "Valor stock OK"],
+                                        "Valor del stock por condición"),
+                            use_container_width=True)
+        e3, e4 = st.columns(2)
+        with e3:
+            st.plotly_chart(linea_costo(["Valor en tránsito"],
+                                        "Valor en tránsito (OC) por semana"),
+                            use_container_width=True)
+        with e4:
+            # variación semana a semana del valor de bodega
+            hh = hist.copy()
+            hh["Variación"] = hh["Valor stock"].diff()
+            fig = go.Figure(go.Bar(
+                x=hh["Semana"], y=hh["Variación"],
+                marker_color=["#E74C3C" if v and v > 0 else "#27AE60" for v in hh["Variación"]],
+                hovertemplate="%{x}<br>%{y:$,.0f}<extra>Variación</extra>"))
+            fig.update_layout(title="Variación del valor de bodega vs semana anterior",
+                              height=320, margin=dict(l=10, r=10, t=45, b=10),
+                              plot_bgcolor="#fff", paper_bgcolor="#fff",
+                              xaxis=dict(showgrid=False),
+                              yaxis=dict(title="CLP", showgrid=True, gridcolor="#EEF1F4"))
+            st.plotly_chart(fig, use_container_width=True)
+        st.caption("💡 En la variación, **rojo** = subió el capital inmovilizado en bodega, "
+                   "**verde** = bajó.")
+
+    st.markdown("---")
+
     # ---------------- Tabla de costos por grupo de compra ----------------
     if "Grupo de compras" in datos.columns:
         st.markdown("#### Resumen por grupo de compra")
@@ -3566,21 +3691,27 @@ def pagina_costos():
         st.dataframe(vista.rename(columns={"Grupo de compras": "Grupo de compra"}),
                      use_container_width=True, hide_index=True)
 
-    # ---------------- Materiales de mayor valor ----------------
-    st.markdown("#### Materiales de mayor valor en stock")
-    top = datos.nlargest(30, "Valor stock")
+    # ---------------- Materiales de mayor valor / búsqueda ----------------
+    st.markdown("#### Materiales por valor en stock")
+    st.caption("Muestra los 30 de mayor valor. Usa el buscador para encontrar cualquier material.")
     cols = [c for c in ["Material", "Texto breve de material", "Grupo de compras",
                         "Stock", "Precio", "Valor stock", "Condicion Stock",
                         "Cantidad en Transito", "Valor en tránsito"]
-            if c in top.columns]
-    vista_t = top[cols].rename(columns={"Texto breve de material": "Descripción",
-                                        "Grupo de compras": "Grupo de compra"})
+            if c in datos.columns]
+    base_t = datos[cols].rename(columns={"Texto breve de material": "Descripción"})
+    buscado = buscar_en_tabla(base_t, "buscar_cost")
+    # si no buscó nada, mostrar top 30; si buscó, mostrar lo encontrado
+    if len(buscado) == len(base_t):
+        top = buscado.nlargest(30, "Valor stock")
+    else:
+        top = buscado.sort_values("Valor stock", ascending=False)
+    vista_t = top.rename(columns={"Grupo de compras": "Grupo de compra"})
     for c in ["Precio", "Valor stock", "Valor en tránsito"]:
         if c in vista_t.columns:
             vista_t[c] = vista_t[c].apply(_fmt_clp)
     st.dataframe(vista_t, use_container_width=True, hide_index=True)
     st.download_button("⬇️  Descargar costos por material (CSV)",
-                       data=datos[cols].to_csv(index=False).encode("utf-8-sig"),
+                       data=base_t.to_csv(index=False).encode("utf-8-sig"),
                        file_name="costos_materiales.csv", mime="text/csv", key="dl_cost")
 
 
