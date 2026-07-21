@@ -111,7 +111,7 @@ METODO_POR_TIPO = {
 #     (tiempo hasta la próxima demanda = "Indeterminado")
 #   - con MIN_DEMANDAS_PR o más -> método PR (Proceso de Renovación)
 #     (tiempo hasta la próxima demanda estimado en días)
-MIN_DEMANDAS_PR = 4
+MIN_DEMANDAS_PR = 3
 
 # Para expresar en DÍAS los intervalos que el modelo calcula en meses.
 DIAS_POR_MES = 30
@@ -1632,6 +1632,45 @@ def _consolidar_sufijos(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _accion_tat(dias_hasta_demanda, tat_promedio, resultado, margen=20):
+    """
+    Decide qué hacer con un material comparando el tiempo hasta la próxima
+    demanda con el TAT (tiempo que tarda en llegar una compra).
+
+    Solo aplica a materiales que, tras la demanda, quedarían en bajo stock o
+    quiebre (los que van a necesitar reposición). Para el resto, no urge pedir.
+
+    Devuelve (acción, holgura_días):
+      holgura = días_hasta_demanda - tat_promedio
+               (cuánto tiempo "sobra" desde que pides hasta que se necesita).
+
+    - "Pedir ya (gestionar con urgencia)"  -> el TAT es MAYOR que el tiempo hasta
+        la demanda: aunque pidas hoy, no alcanza a llegar. Riesgo de quiebre.
+    - "Gestionar solicitud para cumplir plazos" -> queda poca holgura (<= margen,
+        por defecto 20 días): hay que iniciar la solped ahora para no atrasarse.
+    - "Pedir en X días (tiempo óptimo)" -> hay holgura de sobra: se puede esperar
+        hasta 'holgura - margen' días antes de pedir y aún llegar a tiempo.
+    - "Sin urgencia" -> el stock cubre la demanda sin quedar bajo/quiebre.
+    - "Sin dato TAT" / "Sin pronóstico" -> falta información para decidir.
+    """
+    if resultado not in ("No cumple", "Urgente", "Alerta"):
+        return "Sin urgencia", None
+    if pd.isna(tat_promedio) or tat_promedio <= 0:
+        return "Sin dato TAT", None
+    if pd.isna(dias_hasta_demanda):
+        # necesita reposición pero no se sabe cuándo: mejor gestionar
+        return "Pedir ya (gestionar con urgencia)", None
+
+    holgura = dias_hasta_demanda - tat_promedio
+    if holgura < 0:
+        return "Pedir ya (gestionar con urgencia)", round(holgura)
+    if holgura <= margen:
+        return "Gestionar solicitud para cumplir plazos", round(holgura)
+    # hay holgura: se puede esperar (dejando el margen de seguridad)
+    esperar = int(holgura - margen)
+    return f"Pedir en ~{esperar} días (óptimo)", round(holgura)
+
+
 def _resultado_demanda(stock, demanda, stock_seg):
     """
     Veredicto de cobertura, según lo definido por el negocio. Compara el stock
@@ -1851,16 +1890,33 @@ def _unir_demanda(base: pd.DataFrame) -> pd.DataFrame:
         base["Cumple_Demanda"] = "Sin pronóstico"
         base["Stock tras demanda"] = pd.NA
         base["Resultado demanda"] = "Sin pronóstico"
+        base["Acción de compra"] = "Sin pronóstico"
+        base["Holgura días (demanda - TAT)"] = pd.NA
         return base
 
-    # Pronóstico consolidado según el tipo de demanda
+    # Pronóstico consolidado según el tipo de demanda.
+    # OJO: para Intermitente/Irregular, el pronóstico del Proceso de Renovación
+    # (PR_Pronostico_redondeado) SOLO existe cuando hay >=3 demandas. Cuando hay
+    # menos, se usa SBA, cuyo valor está en 'Pronostico_redondeado'. Por eso se
+    # toma PR si existe y, si no, se cae a Pronostico_redondeado. Así NINGÚN
+    # material con historial queda sin pronóstico.
+    def _num(x):
+        v = pd.to_numeric(x, errors="coerce")
+        return v if pd.notna(v) else None
+
     def _consolidado(r):
         tipo = r.get("Tipo_demanda")
-        if tipo in ("Constante", "Errática"):
-            return r.get("Pronostico_redondeado")
+        if tipo == "Sin demanda":
+            return pd.NA
         if tipo in ("Intermitente", "Irregular"):
-            return r.get("PR_Pronostico_redondeado")
-        return pd.NA
+            pr = _num(r.get("PR_Pronostico_redondeado"))
+            if pr is not None:
+                return pr
+        # Constante, Errática, o SBA (intermitente/irregular con <3 demandas)
+        base_val = _num(r.get("Pronostico_redondeado"))
+        if base_val is not None:
+            return base_val
+        return _num(r.get("Pronostico"))
     dem["Pronostico_Consolidado"] = dem.apply(_consolidado, axis=1)
     # Tiempo hasta la próxima demanda en meses (desde días)
     if "Dias_hasta_demanda" in dem.columns:
@@ -1875,17 +1931,35 @@ def _unir_demanda(base: pd.DataFrame) -> pd.DataFrame:
     # Cumple_Demanda: comparar stock actual vs pronóstico (+ stock de seguridad)
     if "Stock" in base.columns and "Pronostico_Consolidado" in base.columns:
         seg = base["Stock Seguridad"] if "Stock Seguridad" in base.columns else pd.Series(0, index=base.index)
+        stock_num = pd.to_numeric(base["Stock"], errors="coerce")
+        demanda_num = pd.to_numeric(base["Pronostico_Consolidado"], errors="coerce")
+        transito = pd.to_numeric(base.get("Cantidad en Transito"), errors="coerce").fillna(0) \
+            if "Cantidad en Transito" in base.columns else pd.Series(0, index=base.index)
+        # Disponible = stock actual + lo que ya viene en camino (OC en tránsito)
+        disponible = stock_num + transito
+
         base["Cumple_Demanda"] = [
             _cumple_demanda(s, d, sg)
-            for s, d, sg in zip(base["Stock"], base["Pronostico_Consolidado"], seg)
+            for s, d, sg in zip(stock_num, demanda_num, seg)
         ]
-        # Qué queda de stock después de atender la próxima demanda
-        base["Stock tras demanda"] = pd.to_numeric(base["Stock"], errors="coerce") - \
-            pd.to_numeric(base["Pronostico_Consolidado"], errors="coerce")
+        # Qué queda de stock después de atender la próxima demanda (con lo en tránsito)
+        base["Stock tras demanda"] = disponible - demanda_num
         base["Resultado demanda"] = [
             _resultado_demanda(s, d, sg)
-            for s, d, sg in zip(base["Stock"], base["Pronostico_Consolidado"], seg)
+            for s, d, sg in zip(disponible, demanda_num, seg)
         ]
+
+        # --- Planificación por TAT: cuándo pedir para llegar antes de la demanda ---
+        dias_dem = pd.to_numeric(base.get("Tiempo_Prox_Demanda"), errors="coerce") * DIAS_POR_MES
+        tat = pd.to_numeric(base.get("TAT Promedio"), errors="coerce") \
+            if "TAT Promedio" in base.columns else pd.Series(pd.NA, index=base.index)
+        acciones, holguras = [], []
+        for dd, tt, res in zip(dias_dem, tat, base["Resultado demanda"]):
+            a, h = _accion_tat(dd, tt, res)
+            acciones.append(a)
+            holguras.append(h)
+        base["Acción de compra"] = acciones
+        base["Holgura días (demanda - TAT)"] = holguras
     return base
 
 
@@ -2180,7 +2254,7 @@ def filtro_multi(datos, col, etiqueta, key):
     if col not in datos.columns:
         return None
     vals = datos[col].astype(str).str.strip()
-    opciones = sorted(v for v in vals.unique() if v and v.lower() != "nan")
+    opciones = sorted(v for v in vals.unique() if v and str(v).lower() != "nan")
     hay_vacios = (vals == "").any() or (vals.str.lower() == "nan").any() or datos[col].isna().any()
     if hay_vacios:
         opciones = opciones + [SIN_DATO]
@@ -3075,6 +3149,68 @@ def pagina_control():
                            data=vista_c.to_csv(index=False).encode("utf-8-sig"),
                            file_name="materiales_criticos.csv", mime="text/csv",
                            key="dl_crit")
+
+    st.markdown("---")
+
+    # ---------------- Planificación de compra por TAT ----------------
+    st.markdown("#### 📅 Planificación de compra (según TAT)")
+    st.caption(
+        "Para los materiales que quedarían en **bajo stock o quiebre** tras la demanda, "
+        "compara el **tiempo hasta la próxima demanda** con el **TAT promedio** (lo que "
+        "tarda en llegar una compra) para decirte **cuándo pedir**:"
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.markdown("🔴 **Pedir ya** — el TAT es mayor que el tiempo hasta la demanda: "
+                "aunque pidas hoy, podría no llegar a tiempo.")
+    c2.markdown("🟠 **Gestionar solicitud** — quedan ≤20 días de holgura: hay que "
+                "iniciar la solped ahora para cumplir el plazo.")
+    c3.markdown("🟢 **Pedir en X días** — hay holgura de sobra: se puede esperar sin "
+                "riesgo (dejando 20 días de margen).")
+
+    if "Acción de compra" not in datos.columns:
+        st.info("Falta el TAT o el pronóstico para calcular la planificación.")
+    else:
+        plan = datos[datos["Acción de compra"].isin(
+            ["Pedir ya (gestionar con urgencia)",
+             "Gestionar solicitud para cumplir plazos"])
+            | datos["Acción de compra"].astype(str).str.startswith("Pedir en")]
+        # KPIs de planificación
+        pk = st.columns(3)
+        pk[0].metric("🔴 Pedir ya",
+                     int((datos["Acción de compra"] == "Pedir ya (gestionar con urgencia)").sum()))
+        pk[1].metric("🟠 Gestionar solicitud",
+                     int((datos["Acción de compra"] == "Gestionar solicitud para cumplir plazos").sum()))
+        pk[2].metric("🟢 Pedir más adelante",
+                     int(datos["Acción de compra"].astype(str).str.startswith("Pedir en").sum()))
+
+        if plan.empty:
+            st.success("Ningún material requiere gestión de compra por TAT en este momento.")
+        else:
+            cols_p = [c for c in [
+                "Material", "Texto breve de material", "Grupo de compras",
+                "Criticidad texto", "Stock", "Cantidad en Transito",
+                "Pronostico_Consolidado", "Stock tras demanda", "Resultado demanda",
+                "Tiempo_hasta_demanda_txt", "TAT Promedio",
+                "Holgura días (demanda - TAT)", "Acción de compra",
+                "Estado gestión"] if c in plan.columns]
+            renombre_p = dict(RENOMBRE_CONTROL)
+            renombre_p.update({
+                "Cantidad en Transito": "Cant. en camino",
+                "Holgura días (demanda - TAT)": "Holgura (días)",
+                "Acción de compra": "Qué hacer",
+            })
+            vista_p = plan[cols_p].rename(columns=renombre_p)
+            # ordenar: primero los urgentes
+            orden_acc = {"Pedir ya (gestionar con urgencia)": 0,
+                         "Gestionar solicitud para cumplir plazos": 1}
+            vista_p = vista_p.assign(
+                _o=plan["Acción de compra"].map(lambda x: orden_acc.get(x, 2)).values
+            ).sort_values(["_o", "Holgura (días)"]).drop(columns="_o")
+            st.dataframe(vista_p, use_container_width=True, hide_index=True)
+            st.download_button("⬇️  Descargar planificación de compra (CSV)",
+                               data=vista_p.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="planificacion_compra_tat.csv", mime="text/csv",
+                               key="dl_plan")
 
     st.markdown("---")
 
