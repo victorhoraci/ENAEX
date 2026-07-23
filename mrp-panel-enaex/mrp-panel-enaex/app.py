@@ -1500,11 +1500,23 @@ def historial_semanal(mrp=None) -> pd.DataFrame:
             "Solped bloqueada": int(obs.str.contains("bloque").sum()),
             "Validación": int(obs.str.contains("validac").sum()),
         }
+        # Disponibilidad CONSERVADORA: solo Stock OK o Sobre Stock cuentan como
+        # disponible (=1). Bajo Stock y Quiebre cuentan como no disponible (=0).
+        ok_sobre = int((cond.isin(["Stock OK", "Sobre Stock"])).sum())
+        fila["Disponibilidad conservadora"] = round(100 * ok_sobre / total, 2)
+
+        # Disponibilidad (normal y conservadora) por clasificación de criticidad
         if "Criticidad" in g.columns:
             crit = g[g["Criticidad"] == "A"]
             if len(crit):
                 q = int((crit["Condicion Stock"] == "Quiebre Stock").sum())
                 fila["Disponibilidad A"] = round(100 * (len(crit) - q) / len(crit), 2)
+            # conservadora por cada clase (A, B, C)
+            for clase in ["A", "B", "C"]:
+                gc = g[g["Criticidad"] == clase]
+                if len(gc):
+                    okc = int((gc["Condicion Stock"].isin(["Stock OK", "Sobre Stock"])).sum())
+                    fila[f"Disp. conservadora {clase}"] = round(100 * okc / len(gc), 2)
 
         # --- Valorización de la semana (si hay precios de MM60) ---
         if precios is not None:
@@ -2520,20 +2532,28 @@ def proveedores_por_material(top=5) -> pd.DataFrame:
 
 def proveedores_gasto_por_anio(moneda="CLP") -> pd.DataFrame:
     """
-    Un registro por proveedor con el gasto de CADA año en columnas (no filtrado),
-    más OTIF, TAT promedio, materiales distintos y si usa contrato marco.
+    Un registro por proveedor con el gasto de CADA año y CADA moneda en columnas
+    (no filtrado), más OTIF, TAT promedio, materiales distintos y contrato marco.
     """
     prov = analisis_proveedores()
     if prov.empty:
         return prov
-    col_gasto = f"Gasto {moneda}"
-    if col_gasto not in prov.columns:
-        prov[col_gasto] = np.nan
 
-    piv = prov.pivot_table(index=["Proveedor_Codigo", "Proveedor_Nombre"],
-                           columns="Año", values=col_gasto, aggfunc="sum")
-    piv.columns = [f"Gasto {moneda} {int(c)}" for c in piv.columns]
-    piv = piv.reset_index()
+    # Todas las monedas presentes
+    monedas = sorted({c.replace("Gasto ", "") for c in prov.columns if c.startswith("Gasto ")})
+
+    # Pivote por año para cada moneda
+    piezas = []
+    for mon in monedas:
+        col = f"Gasto {mon}"
+        if col not in prov.columns:
+            continue
+        piv = prov.pivot_table(index=["Proveedor_Codigo", "Proveedor_Nombre"],
+                               columns="Año", values=col, aggfunc="sum")
+        piv.columns = [f"{mon} {int(c)}" for c in piv.columns]
+        piezas.append(piv)
+    piv_all = pd.concat(piezas, axis=1).reset_index() if piezas else \
+        prov[["Proveedor_Codigo", "Proveedor_Nombre"]].drop_duplicates()
 
     resumen = prov.groupby(["Proveedor_Codigo", "Proveedor_Nombre"], as_index=False).agg(
         OTIF=("OTIF", "mean"),
@@ -2548,16 +2568,20 @@ def proveedores_gasto_por_anio(moneda="CLP") -> pd.DataFrame:
     cm = cm.rename(columns={"Tiene contrato marco": "Contrato marco"})
 
     out = resumen.merge(cm, on=["Proveedor_Codigo", "Proveedor_Nombre"], how="left") \
-                 .merge(piv, on=["Proveedor_Codigo", "Proveedor_Nombre"], how="left")
-    cols_anio = [c for c in out.columns if c.startswith(f"Gasto {moneda} ")]
-    out[f"Gasto {moneda} total"] = out[cols_anio].sum(axis=1)
-    return out.sort_values(f"Gasto {moneda} total", ascending=False).reset_index(drop=True)
+                 .merge(piv_all, on=["Proveedor_Codigo", "Proveedor_Nombre"], how="left")
+    # total por moneda principal (para ordenar)
+    cols_clp = [c for c in out.columns if c.startswith("CLP ")]
+    if cols_clp:
+        out["CLP total"] = out[cols_clp].sum(axis=1)
+        out = out.sort_values("CLP total", ascending=False)
+    return out.reset_index(drop=True)
 
 
 def materiales_gasto_por_anio(moneda="CLP") -> pd.DataFrame:
     """
-    Un registro por material y año con: veces comprado, cantidad, costo,
-    TAT promedio, OTIF promedio (de sus proveedores) y proveedores usados.
+    Un registro por material y año con: veces comprado, cantidad, costo (por
+    moneda), TAT promedio, OTIF promedio, nº de proveedores, si tuvo contrato
+    marco y con qué proveedor, y la lista de proveedores (nombre + código).
     """
     hist = cargar_me2m_historico()
     try:
@@ -2577,17 +2601,35 @@ def materiales_gasto_por_anio(moneda="CLP") -> pd.DataFrame:
         if pd.isna(anio) or not mat:
             continue
         provs = g[["Proveedor_Codigo", "Proveedor_Nombre"]].drop_duplicates()
-        nombres = ", ".join(sorted(provs["Proveedor_Nombre"].dropna().unique())[:3])
-        if provs.shape[0] > 3:
-            nombres += f" (+{provs.shape[0] - 3})"
+        # lista "Nombre (código)"
+        lista_prov = "; ".join(
+            f"{r['Proveedor_Nombre']} ({r['Proveedor_Codigo']})"
+            for _, r in provs.iterrows() if str(r["Proveedor_Nombre"]).strip())
+
+        # contrato marco: ¿alguna compra con contrato? ¿con qué proveedor?
+        con_cm = g[g["Tiene_Contrato_Marco"]]
+        if len(con_cm):
+            tiene_cm = "Sí"
+            prov_cm = con_cm[["Proveedor_Nombre", "Proveedor_Codigo"]].drop_duplicates()
+            prov_cm_txt = "; ".join(
+                f"{r['Proveedor_Nombre']} ({r['Proveedor_Codigo']})"
+                for _, r in prov_cm.iterrows() if str(r["Proveedor_Nombre"]).strip())
+        else:
+            tiene_cm = "No"
+            prov_cm_txt = ""
+
         fila = {
             "Material": mat,
             "Descripción": g["Texto breve"].dropna().iloc[0] if g["Texto breve"].notna().any() else "",
             "Año": int(anio),
             "Veces comprado": g["Documento compras"].nunique() if "Documento compras" in g.columns else len(g),
             "Cantidad comprada": round(float(g["Cantidad de pedido"].sum(skipna=True)), 0),
+            "TAT prom (días)": np.nan,  # se completa luego
             "OTIF prom %": round(float(g["OTIF"].mean()), 1) if g["OTIF"].notna().any() else np.nan,
-            "Proveedores": nombres,
+            "N° proveedores": provs.shape[0],
+            "Contrato marco": tiene_cm,
+            "Proveedor del contrato": prov_cm_txt,
+            "Proveedores": lista_prov,
         }
         for moneda_c, gm in g.groupby("Moneda"):
             fila[f"Costo {moneda_c}"] = round(float(gm["Valor compra"].sum(skipna=True)), 0)
@@ -2595,8 +2637,30 @@ def materiales_gasto_por_anio(moneda="CLP") -> pd.DataFrame:
     mat_anio = pd.DataFrame(filas)
     if mat_anio.empty:
         return mat_anio
-    mat_anio = mat_anio.merge(
+    # TAT del material
+    mat_anio = mat_anio.drop(columns=["TAT prom (días)"]).merge(
         tat.rename(columns={"TAT Promedio": "TAT prom (días)"}), on="Material", how="left")
+
+    # Criticidad, área y grupo de compra desde MM60 / MRP
+    try:
+        mm60 = cargar_mm60()
+        info = mm60[["Material", "Grupo de compras"]].drop_duplicates("Material") \
+            if "Grupo de compras" in mm60.columns else pd.DataFrame(columns=["Material"])
+        # criticidad y área vienen del MRP
+        try:
+            mrp = cargar_mrp().drop_duplicates("Material", keep="last")
+            cols_mrp = [c for c in ["Material", "Criticidad", "Area"] if c in mrp.columns]
+            mrp_i = mrp[cols_mrp].copy()
+            if "Criticidad" in mrp_i.columns:
+                mrp_i["Criticidad texto"] = mrp_i["Criticidad"].apply(_criticidad_texto)
+                mrp_i = mrp_i.drop(columns=["Criticidad"])
+            info = info.merge(mrp_i, on="Material", how="outer")
+        except Exception:
+            pass
+        mat_anio = mat_anio.merge(info, on="Material", how="left")
+    except Exception:
+        pass
+
     return mat_anio.sort_values(["Material", "Año"]).reset_index(drop=True)
 
 
@@ -3253,6 +3317,39 @@ def pagina_demanda():
     with st.expander("Ver todos los datos de este material"):
         st.dataframe(ficha_material(info), use_container_width=True, hide_index=True)
 
+    # ---- Parámetros de inventario sugeridos para ESTE material ----
+    st.markdown("---")
+    st.markdown("#### 🎛️ Parámetros de inventario sugeridos")
+    st.caption("Nuevo stock de seguridad, punto de reorden y lote de compra, "
+               "calculados con la demanda proyectada y el TAT. Se comparan con lo "
+               "que hoy tiene el MRP.")
+    try:
+        par = cargar_parametros()
+        fila_p = par[par["Material"].astype(str) == str(material)]
+    except Exception:
+        fila_p = None
+    if fila_p is None or len(fila_p) == 0:
+        st.info("No hay parámetros calculados para este material (necesita demanda y TAT).")
+    else:
+        rp = fila_p.iloc[0]
+        c = st.columns(3)
+        c[0].metric("Stock de seguridad sugerido", f"{rp.get('SS_60', '—')}",
+                    help=f"Escenario real (TAT actual): {rp.get('SS', '—')}")
+        c[1].metric("Punto de reorden sugerido", f"{rp.get('ROP_60', '—')}",
+                    help=f"Escenario real: {rp.get('ROP', '—')}")
+        c[2].metric("Lote de compra sugerido", f"{rp.get('Lote_Compra', '—')}")
+        c = st.columns(3)
+        ss_mrp = rp.get("SS_MRP")
+        c[0].metric("SS actual en el MRP", "—" if pd.isna(ss_mrp) else f"{ss_mrp:.0f}",
+                    delta=None if pd.isna(ss_mrp) or pd.isna(rp.get("SS_60"))
+                    else f"{rp['SS_60'] - ss_mrp:+.0f} vs sugerido")
+        c[1].metric("Estado del parámetro", str(rp.get("Estado parámetro", "—")))
+        c[2].metric("ROP vs SS-MRP", str(rp.get("Cambio ROP vs SS-MRP", "—")))
+        st.caption(f"Motivo del cálculo de SS: {rp.get('Motivo_SS', '—')}  ·  "
+                   f"TAT usado: {rp.get('TAT_Real_Dias', '—')} días")
+        st.caption("Para ver todos los materiales a la vez, entra a la página "
+                   "**🎛️ Parámetros de inventario**.")
+
     st.markdown("---")
     st.markdown("#### Tabla de materiales (según filtros)")
     cols = ["Material", "Descripción del material", "Centro", "Tipo_demanda", "Metodo",
@@ -3594,6 +3691,10 @@ def pagina_mrp_e002():
             def linea(cols, titulo, eje="Materiales"):
                 fig = go.Figure()
                 colores = {"Disponibilidad": "#27AE60", "Disponibilidad A": "#1565C0",
+                           "Disponibilidad conservadora": "#16A085",
+                           "Disp. conservadora A": "#C0392B",
+                           "Disp. conservadora B": "#E67E22",
+                           "Disp. conservadora C": "#F1C40F",
                            "Sin stock": "#E74C3C", "Bajo stock": "#F39C12",
                            "Con OC": "#2E86DE", "Con Solped": "#2E7D32",
                            "Solped bloqueada": "#C62828", "Validación": "#E65100"}
@@ -3621,6 +3722,27 @@ def pagina_mrp_e002():
                 st.plotly_chart(linea(["Sin stock", "Bajo stock"],
                                       "Materiales sin stock / bajo stock"),
                                 use_container_width=True)
+
+            # Disponibilidad conservadora (solo Stock OK o Sobre Stock = disponible)
+            st.markdown("##### Disponibilidad conservadora")
+            st.caption("Métrica más estricta: un material solo cuenta como "
+                       "**disponible (100%)** si está en **Stock OK o Sobre Stock**. "
+                       "Bajo Stock y Quiebre cuentan como **no disponible (0%)**.")
+            ce1, ce2 = st.columns(2)
+            with ce1:
+                st.plotly_chart(linea(["Disponibilidad", "Disponibilidad conservadora"],
+                                      "Disponibilidad normal vs conservadora (general)", "%"),
+                                use_container_width=True)
+            with ce2:
+                clases = [c for c in ["Disp. conservadora A", "Disp. conservadora B",
+                                      "Disp. conservadora C"] if c in hist.columns]
+                if clases:
+                    st.plotly_chart(linea(clases,
+                                          "Disponibilidad conservadora por criticidad", "%"),
+                                    use_container_width=True)
+                else:
+                    st.info("No hay clasificación de criticidad para desglosar.")
+
             e3, e4 = st.columns(2)
             with e3:
                 st.plotly_chart(linea(["Con OC", "Con Solped"],
@@ -4511,114 +4633,146 @@ def _cols_gasto(df):
 def pagina_proveedores():
     st.markdown(
         '<div class="hdr hdr-azul"><h1>🏭 Proveedores y compras</h1>'
-        '<p>Gasto por año · OTIF · TAT · contrato marco · análisis por material</p></div>',
+        '<p>Gasto por año y moneda · OTIF · TAT · contrato marco · compras por material</p></div>',
         unsafe_allow_html=True,
     )
 
-    tab1, tab2 = st.tabs(["🏭  Por proveedor", "📦  Por material"])
+    try:
+        prov = cargar_prov_por_anio()
+        mat = cargar_mat_por_anio()
+    except FileNotFoundError:
+        st.error("Faltan el **histórico de compras (ME2M)** y/o el **OTIF**. "
+                 "Súbelos en **📥 Cargar archivos**.")
+        return
+    except Exception as e:
+        st.error(f"No se pudo analizar: {e}")
+        return
 
-    # ==================== PROVEEDORES ====================
-    with tab1:
-        try:
-            prov = cargar_prov_por_anio()
-        except FileNotFoundError:
-            st.error("Faltan el **histórico de compras (ME2M)** y/o el **OTIF**. "
-                     "Súbelos en **📥 Cargar archivos**.")
-            prov = pd.DataFrame()
-        except Exception as e:
-            st.error(f"No se pudo analizar: {e}")
-            prov = pd.DataFrame()
+    anios = sorted({int(c.split()[-1]) for c in prov.columns
+                    if c.startswith("CLP ") and c.split()[-1].isdigit()}, reverse=True) \
+        if not prov.empty else []
+    with st.sidebar:
+        st.markdown("### Filtros")
+        sel_anio = st.selectbox("Año", ["Todos"] + [str(a) for a in anios], key="prov_anio_f")
+        # Filtro de contrato marco (aplica a proveedores y materiales)
+        f_contrato = st.multiselect("Contrato marco", ["Sí", "No"], default=["Sí", "No"],
+                                    key="prov_cm_f")
+        # Filtro de criticidad (aplica a la tabla de materiales)
+        crits = []
+        if not mat.empty and "Criticidad texto" in mat.columns:
+            crits = sorted(str(x) for x in mat["Criticidad texto"].dropna().unique()
+                           if str(x).strip())
+        f_crit = st.multiselect("Criticidad (materiales)", crits, default=crits,
+                                key="prov_crit_f") if crits else None
+        if st.button("🔄 Recalcular", key="rec_prov"):
+            st.cache_data.clear()
+            st.rerun()
 
-        if prov.empty:
-            st.info("Sin datos de proveedores.")
-        else:
-            # KPIs
-            k = st.columns(4)
-            k[0].metric("Proveedores", len(prov))
-            if "Gasto CLP total" in prov.columns:
-                k[1].metric("Gasto total CLP", _fmt_clp(prov["Gasto CLP total"].sum()))
-            if "OTIF" in prov.columns and prov["OTIF"].notna().any():
-                k[2].metric("OTIF promedio", f"{prov['OTIF'].mean():.1f}%")
-            k[3].metric("Con contrato marco", int((prov["Contrato marco"] == "Sí").sum()))
+    # ============ PROVEEDORES ============
+    st.markdown("## 🏭 Proveedores")
+    # aplicar filtro de contrato marco
+    if not prov.empty and f_contrato and "Contrato marco" in prov.columns:
+        prov = prov[prov["Contrato marco"].isin(f_contrato)]
+    if prov.empty:
+        st.info("Sin proveedores que coincidan con los filtros.")
+    else:
+        k = st.columns(4)
+        k[0].metric("Proveedores", len(prov))
+        if "CLP total" in prov.columns:
+            k[1].metric("Gasto total CLP", _fmt_clp(prov["CLP total"].sum()))
+        if "OTIF" in prov.columns and prov["OTIF"].notna().any():
+            k[2].metric("OTIF promedio", f"{prov['OTIF'].mean():.1f}%")
+        k[3].metric("Con contrato marco", int((prov["Contrato marco"] == "Sí").sum()))
 
-            # Top 15 por gasto total
-            if "Gasto CLP total" in prov.columns:
-                top = prov.nlargest(15, "Gasto CLP total")
-                fig = go.Figure(go.Bar(
-                    y=top["Proveedor_Nombre"], x=top["Gasto CLP total"], orientation="h",
-                    marker_color="#2E86DE",
-                    text=[_fmt_clp(v) for v in top["Gasto CLP total"]], textposition="outside"))
-                fig.update_layout(title="Top 15 proveedores por gasto total (CLP)",
-                                  height=430, margin=dict(l=10, r=10, t=45, b=10),
-                                  plot_bgcolor="#fff", paper_bgcolor="#fff",
-                                  yaxis=dict(autorange="reversed"))
+        if "CLP total" in prov.columns:
+            top = prov.nlargest(15, "CLP total")
+            fig = go.Figure(go.Bar(
+                y=top["Proveedor_Nombre"], x=top["CLP total"], orientation="h",
+                marker_color="#2E86DE",
+                text=[_fmt_clp(v) for v in top["CLP total"]], textposition="outside"))
+            fig.update_layout(title="Top 15 proveedores por gasto total (CLP)",
+                              height=430, margin=dict(l=10, r=10, t=45, b=10),
+                              plot_bgcolor="#fff", paper_bgcolor="#fff",
+                              yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, use_container_width=True)
+
+        if "OTIF" in prov.columns and prov["OTIF"].notna().any():
+            val = prov[prov["OTIF"].notna() & prov["TAT_prom"].notna()]
+            if not val.empty:
+                fig = go.Figure(go.Scatter(
+                    x=val["TAT_prom"], y=val["OTIF"], mode="markers",
+                    marker=dict(size=9, color=val["OTIF"], colorscale="RdYlGn",
+                                showscale=True, colorbar=dict(title="OTIF%")),
+                    text=val["Proveedor_Nombre"],
+                    hovertemplate="%{text}<br>TAT %{x:.0f}d<br>OTIF %{y:.0f}%<extra></extra>"))
+                fig.update_layout(
+                    title="Calidad del proveedor: OTIF vs TAT (arriba-izquierda = mejor)",
+                    height=370, margin=dict(l=10, r=10, t=45, b=10),
+                    plot_bgcolor="#fff", paper_bgcolor="#fff",
+                    xaxis=dict(title="TAT promedio (días)"), yaxis=dict(title="OTIF (%)"))
                 st.plotly_chart(fig, use_container_width=True)
 
-            # OTIF vs TAT
-            if "OTIF" in prov.columns and prov["OTIF"].notna().any():
-                val = prov[prov["OTIF"].notna() & prov["TAT_prom"].notna()]
-                if not val.empty:
-                    fig = go.Figure(go.Scatter(
-                        x=val["TAT_prom"], y=val["OTIF"], mode="markers",
-                        marker=dict(size=9, color=val["OTIF"], colorscale="RdYlGn",
-                                    showscale=True, colorbar=dict(title="OTIF%")),
-                        text=val["Proveedor_Nombre"],
-                        hovertemplate="%{text}<br>TAT %{x:.0f}d<br>OTIF %{y:.0f}%<extra></extra>"))
-                    fig.update_layout(
-                        title="Calidad del proveedor: OTIF vs TAT (arriba-izquierda = mejor)",
-                        height=370, margin=dict(l=10, r=10, t=45, b=10),
-                        plot_bgcolor="#fff", paper_bgcolor="#fff",
-                        xaxis=dict(title="TAT promedio (días)"), yaxis=dict(title="OTIF (%)"))
-                    st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("---")
-            st.markdown("#### Todos los proveedores — gasto por año (CLP)")
-            st.caption("Cada año es una columna. Además: OTIF, TAT promedio, materiales "
-                       "distintos y si usa contrato marco. Desplázate a la derecha.")
-            # ordenar columnas: identificación, indicadores, luego años
-            cols_anio = sorted([c for c in prov.columns if c.startswith("Gasto CLP ") and c != "Gasto CLP total"])
-            base_cols = ["Proveedor_Codigo", "Proveedor_Nombre", "Contrato marco",
-                         "OTIF", "TAT_prom", "Materiales", "Compras", "Gasto CLP total"]
-            cols = [c for c in base_cols if c in prov.columns] + cols_anio
-            vista = prov[cols].rename(columns={
-                "Proveedor_Codigo": "Código", "Proveedor_Nombre": "Proveedor",
-                "OTIF": "OTIF %", "TAT_prom": "TAT prom (días)"})
-            vista = buscar_en_tabla(vista, "buscar_prov",
-                                    etiqueta="🔎 Buscar proveedor (código o nombre)",
-                                    cols=("Código", "Proveedor"))
-            vista_fmt = vista.copy()
-            for c in _cols_gasto(vista_fmt):
+        st.markdown("#### Todos los proveedores — gasto por año y moneda")
+        st.caption("Cada año y moneda (CLP, USD, EUR, UF, GBP) es una columna. "
+                   "Además: OTIF, TAT promedio, materiales, contrato marco. "
+                   "Desplázate a la derecha para ver todo.")
+        base_cols = ["Proveedor_Codigo", "Proveedor_Nombre", "Contrato marco",
+                     "OTIF", "TAT_prom", "Materiales", "Compras"]
+        gasto_cols = [c for c in prov.columns
+                      if any(c.startswith(f"{mon} ") for mon in ("CLP", "USD", "EUR", "UF", "GBP"))
+                      and c.split()[-1].isdigit()]
+        if sel_anio != "Todos":
+            gasto_cols = [c for c in gasto_cols if c.endswith(sel_anio)]
+        gasto_cols = sorted(gasto_cols, key=lambda c: (c.split()[-1], c.split()[0]))
+        total_cols = [c for c in prov.columns if c.endswith("total")]
+        cols = [c for c in base_cols if c in prov.columns] + total_cols + gasto_cols
+        vista = prov[cols].rename(columns={
+            "Proveedor_Codigo": "Código", "Proveedor_Nombre": "Proveedor",
+            "OTIF": "OTIF %", "TAT_prom": "TAT prom (días)"})
+        vista = buscar_en_tabla(vista, "buscar_prov",
+                                etiqueta="🔎 Buscar proveedor (código o nombre)",
+                                cols=("Código", "Proveedor"))
+        vista_fmt = vista.copy()
+        for c in vista_fmt.columns:
+            if any(c.startswith(m) for m in ("CLP", "USD", "EUR", "UF", "GBP")):
                 vista_fmt[c] = vista_fmt[c].apply(_fmt_clp)
-            st.dataframe(vista_fmt, use_container_width=True, hide_index=True)
-            st.download_button("⬇️  Descargar proveedores (CSV)",
-                               data=vista.to_csv(index=False).encode("utf-8-sig"),
-                               file_name="analisis_proveedores.csv", mime="text/csv",
-                               key="dl_prov")
+        st.dataframe(vista_fmt, use_container_width=True, hide_index=True)
+        st.download_button("⬇️  Descargar proveedores (CSV)",
+                           data=vista.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="analisis_proveedores.csv", mime="text/csv",
+                           key="dl_prov")
 
-    # ==================== MATERIALES ====================
-    with tab2:
-        try:
-            mat = cargar_mat_por_anio()
-        except FileNotFoundError:
-            st.error("Falta el **histórico de compras (ME2M)**. Súbelo en **📥 Cargar archivos**.")
-            mat = pd.DataFrame()
-        except Exception as e:
-            st.error(f"No se pudo analizar: {e}")
-            mat = pd.DataFrame()
+    st.markdown("---")
 
-        if mat.empty:
-            st.info("Sin datos de compras por material.")
+    # ============ MATERIALES (debajo) ============
+    st.markdown("## 📦 Compras por material")
+    if mat.empty:
+        st.info("Sin datos de compras por material.")
+    else:
+        datos_m = mat.copy()
+        if sel_anio != "Todos":
+            datos_m = datos_m[datos_m["Año"] == int(sel_anio)]
+        # filtro de contrato marco
+        if f_contrato and "Contrato marco" in datos_m.columns:
+            datos_m = datos_m[datos_m["Contrato marco"].isin(f_contrato)]
+        # filtro de criticidad
+        if f_crit is not None and "Criticidad texto" in datos_m.columns:
+            datos_m = datos_m[datos_m["Criticidad texto"].astype(str).isin(f_crit)]
+        if datos_m.empty:
+            st.warning("Ningún material coincide con los filtros.")
         else:
-            st.markdown("#### Compras por material y año")
-            st.caption("Por cada material y año: veces comprado, cantidad, costo, "
-                       "TAT promedio, OTIF y los proveedores usados.")
-            cols = ["Material", "Descripción", "Año", "Veces comprado",
-                    "Cantidad comprada", "TAT prom (días)", "OTIF prom %",
-                    "Proveedores"] + [c for c in mat.columns if c.startswith("Costo ")]
-            cols = [c for c in cols if c in mat.columns]
-            vista_m = mat[cols].copy()
-            vista_m = buscar_en_tabla(vista_m, "buscar_matc",
-                                      cols=("Material", "Descripción"))
+            st.caption("Por material y año: criticidad, veces comprado, cantidad, "
+                       "costo por moneda, TAT, OTIF, cuántos proveedores y si hubo "
+                       "contrato marco (con quién). Al final, la lista de proveedores.")
+            cols = ["Material", "Descripción", "Criticidad texto", "Area",
+                    "Grupo de compras", "Año", "Veces comprado", "Cantidad comprada",
+                    "TAT prom (días)", "OTIF prom %", "N° proveedores", "Contrato marco",
+                    "Proveedor del contrato"] + \
+                   [c for c in datos_m.columns if c.startswith("Costo ")] + ["Proveedores"]
+            cols = [c for c in cols if c in datos_m.columns]
+            vista_m = datos_m[cols].rename(columns={
+                "Criticidad texto": "Criticidad", "Grupo de compras": "Grupo compra"})
+            vista_m = buscar_en_tabla(vista_m, "buscar_matc", cols=("Material", "Descripción"))
             vista_fmt = vista_m.copy()
             for c in [c for c in vista_fmt.columns if c.startswith("Costo ")]:
                 vista_fmt[c] = vista_fmt[c].apply(_fmt_clp)
@@ -4628,19 +4782,21 @@ def pagina_proveedores():
                                file_name="compras_por_material.csv", mime="text/csv",
                                key="dl_matc")
 
-            # Top materiales por costo total
-            if "Costo CLP" in mat.columns:
-                top = mat.groupby("Descripción", as_index=False)["Costo CLP"].sum() \
-                         .nlargest(15, "Costo CLP")
+            if "Costo CLP" in datos_m.columns:
+                top = datos_m.groupby("Descripción", as_index=False)["Costo CLP"].sum() \
+                             .nlargest(15, "Costo CLP")
                 fig = go.Figure(go.Bar(
                     y=top["Descripción"], x=top["Costo CLP"], orientation="h",
                     marker_color="#8E44AD",
                     text=[_fmt_clp(v) for v in top["Costo CLP"]], textposition="outside"))
-                fig.update_layout(title="Top 15 materiales por costo histórico (CLP)",
+                fig.update_layout(title="Top 15 materiales por costo (CLP)",
                                   height=430, margin=dict(l=10, r=10, t=45, b=10),
                                   plot_bgcolor="#fff", paper_bgcolor="#fff",
                                   yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig, use_container_width=True)
+
+
+
 
 
 
@@ -4695,22 +4851,40 @@ def pagina_cargar():
 
     st.markdown("---")
     fuentes = [
-        ("MB51 — movimientos (Demanda)", "MB51", CARPETA_MB51, True),
-        ("MB5B — stock del mes (Demanda)", "MB5B", CARPETA_MB5B, False),
-        ("MRP semanal — Planificacion_Simpl", "MRP", CARPETA_MRP, False),
-        ("MM60 — maestro de materiales", "MM60", CARPETA_MM60, True),
-        ("ME5A — solicitudes (solped)", "ME5A", CARPETA_ME5A, True),
-        ("ME2M — órdenes de compra", "ME2M", CARPETA_ME2M, True),
-        ("TAT — Vista Ejecutiva (hoja Dias_TAT)", "TAT", CARPETA_TAT, True),
+        ("MB51 — movimientos (Demanda)", "MB51", CARPETA_MB51, True,
+         "MB51 LAYOUT / CALCDEMANDA (movimientos para el pronóstico de demanda)."),
+        ("MB5B — stock del mes (Demanda)", "MB5B", CARPETA_MB5B, False,
+         "MB5B LAYOUT. Armar SIEMPRE en este orden de columnas: Material · "
+         "Descripción del material · De fecha · A fecha · Stock inicial · "
+         "Total ctd.entrada mcía. · Total cantidades salida · Stock de cierre · "
+         "Unidad medida base · Stock especial · Centro."),
+        ("MRP semanal — Planificacion_Simpl", "MRP", CARPETA_MRP, False,
+         "Se ingresa el Excel de Planificación SIMPL. Debe traer la fecha en el "
+         "nombre (ej. Planificacion_Simpl_-_Prillex_08072026.xlsx)."),
+        ("MM60 — maestro de materiales", "MM60", CARPETA_MM60, True,
+         "MM60 LAYOUT / MRP: datos del NUEVO REPORTE MRP."),
+        ("ME5A — solicitudes (solped)", "ME5A", CARPETA_ME5A, True,
+         "ME5A LAYOUT / MRP SOLPED: solped generadas por MRP MRO."),
+        ("ME2M — órdenes de compra", "ME2M", CARPETA_ME2M, True,
+         "ME2M LAYOUT / MRP: OC en tránsito."),
+        ("TAT — Vista Ejecutiva (hoja Dias_TAT)", "TAT", CARPETA_TAT, True,
+         "Copiar los materiales de MM60 en el TAT de Emilio y descargar la "
+         "Vista Ejecutiva (hoja Dias_TAT)."),
+        ("ME2M histórico — compras", "ME2M_HIST", CARPETA_ME2M_HIST, True,
+         "ME2M LAYOUT / MRPREPORTE: MRP REPORTE ANÁLISIS PYTHON (historial de compra)."),
+        ("OTIF — Activación 2.0", "OTIF", CARPETA_OTIF, False,
+         "Archivo Activacion 2.0.xlsx de la carpeta de Activación · Seguimiento de "
+         "OC (Base de datos). Se usa tal cual, sin modificarlo."),
     ]
     st.info("📌 El **MRP semanal** y el **MB5B** se **acumulan**: cada archivo nuevo "
             "se suma a los anteriores para poder ver la evolución en el tiempo. "
             "Por eso el MRP debe traer **la fecha en el nombre** "
             "(por ejemplo `Planificacion_Simpl_-_Prillex_08072026.xlsx`), que es de "
             "donde se saca la semana. El resto de archivos reemplaza al anterior.")
-    for etiqueta, sub, carpeta, reemplaza in fuentes:
+    for etiqueta, sub, carpeta, reemplaza, instruccion in fuentes:
         modo = "**reemplaza** el anterior" if reemplaza else "**se agrega** a los anteriores"
         st.markdown(f"##### {etiqueta}")
+        st.caption(f"📋 {instruccion}")
         st.caption(f"Al subirlo, {modo}.")
         archivo = st.file_uploader(etiqueta, type=["xlsx", "xls"], key=f"up_{sub}",
                                    label_visibility="collapsed")
