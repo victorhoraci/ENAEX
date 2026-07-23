@@ -2684,6 +2684,31 @@ def _secret(clave: str, defecto=None):
     return defecto
 
 
+# Subcarpetas de datos que debe contener la carpeta correcta del repo.
+# Sirven para reconocerla cuando hay que autodetectarla.
+SUBCARPETAS_DATOS = ("MB51", "MB5B", "MRP", "MM60", "ME5A", "ME2M",
+                     "ME2M_HIST", "TAT", "OTIF")
+
+# Memoria de la carpeta ya resuelta, para no consultar la API en cada guardado.
+_PREFIJO_RESUELTO: dict = {}
+
+
+def limpiar_ruta(ruta) -> str:
+    """
+    Normaliza una ruta del repositorio.
+
+    Es la corrección clave: si el prefijo viene copiado del árbol de GitHub
+    (que muestra las carpetas anidadas como «carpeta/ subcarpeta»), queda un
+    ESPACIO dentro de la ruta y GitHub crea una carpeta nueva llamada
+    " subcarpeta" en vez de escribir en la que ya existe.
+
+    'mrp-panel-enaex/ mrp-panel-enaex ' -> 'mrp-panel-enaex/mrp-panel-enaex'
+    """
+    texto = str(ruta or "").replace("\\", "/").replace("\u00a0", " ")
+    partes = [p.strip() for p in texto.split("/")]
+    return "/".join(p for p in partes if p)
+
+
 def _config():
     """Devuelve la configuración de GitHub, o None si no está completa."""
     token = _secret("GITHUB_TOKEN")
@@ -2692,9 +2717,9 @@ def _config():
         return None
     return {
         "token": token,
-        "repo": repo,
-        "branch": _secret("GITHUB_BRANCH", "main"),
-        "prefix": str(_secret("GITHUB_DATA_PREFIX", "data")).strip("/"),
+        "repo": limpiar_ruta(repo),
+        "branch": str(_secret("GITHUB_BRANCH", "main")).strip(),
+        "prefix": limpiar_ruta(_secret("GITHUB_DATA_PREFIX", "data")) or "data",
     }
 
 
@@ -2732,7 +2757,7 @@ def _headers(token: str) -> dict:
 def _listar_dir(cfg: dict, carpeta: str) -> list[dict]:
     """Lista los archivos de una carpeta del repo (name, path, sha)."""
     import requests
-    url = f"{API}/repos/{cfg['repo']}/contents/{carpeta}"
+    url = f"{API}/repos/{cfg['repo']}/contents/{limpiar_ruta(carpeta)}"
     r = requests.get(url, headers=_headers(cfg["token"]),
                      params={"ref": cfg["branch"]}, timeout=30)
     if r.status_code == 200 and isinstance(r.json(), list):
@@ -2740,10 +2765,105 @@ def _listar_dir(cfg: dict, carpeta: str) -> list[dict]:
     return []
 
 
+# --------------------------------------------------------------------------
+# Resolver la carpeta de datos QUE YA EXISTE en el repositorio
+# --------------------------------------------------------------------------
+def _candidatos_prefijo(prefijo: str) -> list[str]:
+    """Rutas posibles donde puede estar la carpeta de datos, en orden."""
+    p = limpiar_ruta(prefijo)
+    raiz = p.split("/")[0] if p else ""
+    posibles = []
+    if p:
+        posibles += [p, f"{p}/data", f"{p}/datos"]
+    if raiz:
+        posibles += [f"{raiz}/{raiz}/data", f"{raiz}/{raiz}", f"{raiz}/data", raiz]
+    posibles += ["data", "datos"]
+    vistos, limpios = set(), []
+    for ruta in posibles:
+        ruta = limpiar_ruta(ruta)
+        if ruta and ruta not in vistos:
+            vistos.add(ruta)
+            limpios.append(ruta)
+    return limpios
+
+
+def _tiene_subcarpetas_datos(items: list[dict]) -> bool:
+    """True si el listado corresponde a la carpeta de datos (MB51, MRP, ...)."""
+    nombres = {str(i.get("name", "")).upper() for i in items
+               if i.get("type") == "dir"}
+    return bool(nombres & {s.upper() for s in SUBCARPETAS_DATOS})
+
+
+def gh_prefijo(cfg: dict | None = None) -> str:
+    """
+    Devuelve la carpeta REAL del repo donde hay que escribir.
+
+    Busca la carpeta de datos que ya existe (la que contiene MB51, MRP, MM60…)
+    y la usa, en vez de crear una carpeta nueva. Si no logra encontrarla,
+    devuelve el prefijo configurado ya normalizado.
+    """
+    cfg = cfg or _config()
+    if cfg is None:
+        return ""
+    clave = (cfg["repo"], cfg["branch"], cfg["prefix"])
+    if clave in _PREFIJO_RESUELTO:
+        return _PREFIJO_RESUELTO[clave]
+
+    resuelto, primera_existente = None, None
+    for ruta in _candidatos_prefijo(cfg["prefix"]):
+        try:
+            items = _listar_dir(cfg, ruta)
+        except Exception:
+            continue
+        if not items:
+            continue
+        if primera_existente is None:
+            primera_existente = ruta
+        if _tiene_subcarpetas_datos(items):
+            resuelto = ruta
+            break
+
+    resuelto = resuelto or primera_existente or limpiar_ruta(cfg["prefix"])
+    _PREFIJO_RESUELTO[clave] = resuelto
+    return resuelto
+
+
+def gh_ruta_destino() -> str:
+    """Ruta completa (repo + carpeta) donde se guardarán los archivos."""
+    cfg = _config()
+    if cfg is None:
+        return "—"
+    return f"{cfg['repo']} · rama {cfg['branch']} · {gh_prefijo(cfg)}/"
+
+
+def gh_diagnostico() -> dict:
+    """Información para mostrar en pantalla y verificar dónde se guarda."""
+    cfg = _config()
+    if cfg is None:
+        return {"ok": False, "detalle": "Faltan GITHUB_TOKEN o GITHUB_REPO."}
+    prefijo_conf = str(_secret("GITHUB_DATA_PREFIX", "data"))
+    destino = gh_prefijo(cfg)
+    try:
+        items = _listar_dir(cfg, destino)
+    except Exception:
+        items = []
+    carpetas = sorted(str(i["name"]) for i in items if i.get("type") == "dir")
+    return {
+        "ok": bool(carpetas),
+        "repo": cfg["repo"],
+        "rama": cfg["branch"],
+        "prefijo_configurado": prefijo_conf,
+        "prefijo_usado": destino,
+        "corregido": limpiar_ruta(prefijo_conf) != destino
+                     or prefijo_conf.strip("/") != limpiar_ruta(prefijo_conf),
+        "subcarpetas": carpetas,
+    }
+
+
 def _sha_de(cfg: dict, ruta: str) -> str | None:
     """Devuelve el sha del archivo si ya existe (necesario para actualizarlo)."""
     import requests
-    url = f"{API}/repos/{cfg['repo']}/contents/{ruta}"
+    url = f"{API}/repos/{cfg['repo']}/contents/{limpiar_ruta(ruta)}"
     r = requests.get(url, headers=_headers(cfg["token"]),
                      params={"ref": cfg["branch"]}, timeout=30)
     if r.status_code == 200:
@@ -2754,6 +2874,7 @@ def _sha_de(cfg: dict, ruta: str) -> str | None:
 def _put(cfg: dict, ruta: str, contenido: bytes, mensaje: str):
     """Crea o actualiza un archivo en el repo."""
     import requests
+    ruta = limpiar_ruta(ruta)
     url = f"{API}/repos/{cfg['repo']}/contents/{ruta}"
     data = {
         "message": mensaje,
@@ -2770,7 +2891,7 @@ def _put(cfg: dict, ruta: str, contenido: bytes, mensaje: str):
 def _delete(cfg: dict, ruta: str, sha: str, mensaje: str):
     """Borra un archivo del repo."""
     import requests
-    url = f"{API}/repos/{cfg['repo']}/contents/{ruta}"
+    url = f"{API}/repos/{cfg['repo']}/contents/{limpiar_ruta(ruta)}"
     data = {"message": mensaje, "sha": sha, "branch": cfg["branch"]}
     r = requests.delete(url, headers=_headers(cfg["token"]), json=data, timeout=120)
     r.raise_for_status()
@@ -2788,7 +2909,7 @@ def gh_guardar(subcarpeta: str, nombre: str, contenido: bytes, reemplazar: bool 
     cfg = _config()
     if cfg is None:
         raise RuntimeError("GitHub no está configurado (falta GITHUB_TOKEN o GITHUB_REPO).")
-    carpeta = f"{cfg['prefix']}/{subcarpeta}"
+    carpeta = f"{gh_prefijo(cfg)}/{limpiar_ruta(subcarpeta)}"
     if reemplazar:
         for item in _listar_dir(cfg, carpeta):
             if item["name"].lower().endswith((".xlsx", ".xls")):
@@ -2805,7 +2926,7 @@ def gh_guardar_mb51(nombre: str, contenido: bytes) -> str:
     cfg = _config()
     if cfg is None:
         raise RuntimeError("GitHub no está configurado (falta GITHUB_TOKEN o GITHUB_REPO).")
-    carpeta = f"{cfg['prefix']}/MB51"
+    carpeta = f"{gh_prefijo(cfg)}/MB51"
     for item in _listar_dir(cfg, carpeta):
         if item["name"].lower().endswith((".xlsx", ".xls")):
             _delete(cfg, item["path"], item["sha"], f"Reemplazar MB51: borrar {item['name']}")
@@ -2821,7 +2942,7 @@ def gh_agregar_mb5b(nombre: str, contenido: bytes) -> str:
     cfg = _config()
     if cfg is None:
         raise RuntimeError("GitHub no está configurado (falta GITHUB_TOKEN o GITHUB_REPO).")
-    carpeta = f"{cfg['prefix']}/MB5B"
+    carpeta = f"{gh_prefijo(cfg)}/MB5B"
     _put(cfg, f"{carpeta}/{nombre}", contenido, f"Agregar MB5B: {nombre}")
     return nombre
 
@@ -2997,6 +3118,34 @@ def buscar_en_tabla(df, key, etiqueta="🔎 Buscar material (código o nombre)",
     else:
         st.caption(f"{len(filtrado)} resultado(s) para «{texto}».")
     return filtrado
+
+
+# --------------------------------------------------------------------------
+# Vista compartida de la tabla de Parámetros de inventario
+# (la usan la página de Parámetros y la de Demanda y Pronóstico, para que
+#  ambas muestren exactamente las mismas columnas)
+# --------------------------------------------------------------------------
+COLS_PARAMETROS = ["Material", "Descripción", "ABC", "Tipo_demanda", "d",
+                   "TAT_Real_Dias", "SS", "ROP", "SS_60", "ROP_60", "Lote_Compra",
+                   "SS_MRP", "Lote_MRP", "Estado parámetro", "Cambio ROP vs SS-MRP",
+                   "Dif ROP - SS MRP", "Motivo_SS"]
+
+RENOMBRE_PARAMETROS = {
+    "d": "Demanda esperada", "TAT_Real_Dias": "TAT real (días)",
+    "SS": "SS real", "ROP": "ROP real", "SS_60": "SS sugerido",
+    "ROP_60": "ROP sugerido", "Lote_Compra": "Lote sugerido",
+    "SS_MRP": "SS actual (MRP)", "Lote_MRP": "Lote actual (MRP)",
+    "Dif ROP - SS MRP": "Diferencia",
+}
+
+
+def vista_parametros(datos):
+    """Deja el DataFrame de parámetros con las columnas y nombres finales."""
+    cols = [c for c in COLS_PARAMETROS if c in datos.columns]
+    vista = datos[cols].rename(columns=RENOMBRE_PARAMETROS)
+    if "Material" in vista.columns:
+        vista = vista.sort_values("Material")
+    return vista
 
 
 def _card(lbl, val, sub=""):
@@ -3323,6 +3472,7 @@ def pagina_demanda():
     st.caption("Nuevo stock de seguridad, punto de reorden y lote de compra, "
                "calculados con la demanda proyectada y el TAT. Se comparan con lo "
                "que hoy tiene el MRP.")
+    par = None
     try:
         par = cargar_parametros()
         fila_p = par[par["Material"].astype(str) == str(material)]
@@ -3347,8 +3497,28 @@ def pagina_demanda():
         c[2].metric("ROP vs SS-MRP", str(rp.get("Cambio ROP vs SS-MRP", "—")))
         st.caption(f"Motivo del cálculo de SS: {rp.get('Motivo_SS', '—')}  ·  "
                    f"TAT usado: {rp.get('TAT_Real_Dias', '—')} días")
-        st.caption("Para ver todos los materiales a la vez, entra a la página "
-                   "**🎛️ Parámetros de inventario**.")
+
+    # ---- Tabla completa de Parámetros de inventario (todos los materiales) ----
+    st.markdown("")
+    st.markdown("##### 📋 Tabla de parámetros de inventario · todos los materiales")
+    st.caption("Es la misma tabla de la página **🎛️ Parámetros de inventario**, "
+               "puesta aquí para tener toda la información junta.")
+    if par is None or len(par) == 0:
+        st.info("Todavía no hay parámetros calculados (se necesitan demanda y TAT).")
+    else:
+        solo_este = st.checkbox("Ver solo el material seleccionado arriba",
+                                value=False, key="par_solo_material_demanda")
+        base_par = (par[par["Material"].astype(str) == str(material)]
+                    if solo_este else par)
+        vista_par = vista_parametros(base_par)
+        vista_par = buscar_en_tabla(vista_par, "buscar_par_demanda",
+                                    cols=("Material", "Descripción"))
+        st.dataframe(vista_par, use_container_width=True, hide_index=True)
+        st.caption(f"{len(vista_par):,}".replace(",", ".") + " material(es) en la tabla.")
+        st.download_button("⬇️  Descargar parámetros (CSV)",
+                           data=vista_par.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="parametros_inventario.csv", mime="text/csv",
+                           key="dl_par_demanda")
 
     st.markdown("---")
     st.markdown("#### Tabla de materiales (según filtros)")
@@ -4593,16 +4763,7 @@ def pagina_parametros():
 
     # ---------------- Tabla completa ----------------
     st.markdown("#### Todos los materiales")
-    cols = [c for c in ["Material", "Descripción", "ABC", "Tipo_demanda", "d",
-                        "TAT_Real_Dias", "SS", "ROP", "SS_60", "ROP_60", "Lote_Compra",
-                        "SS_MRP", "Lote_MRP", "Estado parámetro", "Cambio ROP vs SS-MRP",
-                        "Dif ROP - SS MRP", "Motivo_SS"] if c in datos.columns]
-    vista = datos[cols].rename(columns={
-        "d": "Demanda esperada", "TAT_Real_Dias": "TAT real (días)",
-        "SS": "SS real", "ROP": "ROP real", "SS_60": "SS sugerido",
-        "ROP_60": "ROP sugerido", "Lote_Compra": "Lote sugerido",
-        "SS_MRP": "SS actual (MRP)", "Lote_MRP": "Lote actual (MRP)",
-        "Dif ROP - SS MRP": "Diferencia"}).sort_values("Material")
+    vista = vista_parametros(datos)
     vista = buscar_en_tabla(vista, "buscar_par", cols=("Material", "Descripción"))
     st.dataframe(vista, use_container_width=True, hide_index=True)
     st.download_button("⬇️  Descargar parámetros (CSV)",
@@ -4832,6 +4993,36 @@ def pagina_cargar():
     if modo_github:
         st.success("🟢 Los archivos se guardarán **en GitHub** (permanente). "
                    "La app se actualizará sola en ~1 minuto.")
+        with st.expander("📍 ¿Dónde se guardan exactamente? (verificar carpeta)",
+                         expanded=False):
+            try:
+                d = gh_diagnostico()
+                st.markdown(
+                    f"- **Repositorio:** `{d['repo']}`\n"
+                    f"- **Rama:** `{d['rama']}`\n"
+                    f"- **Carpeta configurada:** `{d['prefijo_configurado']}`\n"
+                    f"- **Carpeta que se usará:** `{d['prefijo_usado']}/`"
+                )
+                if d["corregido"]:
+                    st.warning(
+                        "La ruta configurada en `GITHUB_DATA_PREFIX` tenía espacios "
+                        "o no apuntaba a la carpeta de datos. La app la **corrigió "
+                        f"sola** y escribirá en `{d['prefijo_usado']}/`, la carpeta "
+                        "que ya existe. Para dejarlo prolijo, actualiza el secret "
+                        f'con:  `GITHUB_DATA_PREFIX = "{d["prefijo_usado"]}"`'
+                    )
+                if d["subcarpetas"]:
+                    st.caption("Subcarpetas encontradas ahí: "
+                               + ", ".join(f"`{c}`" for c in d["subcarpetas"]))
+                else:
+                    st.error(
+                        "No se encontró ninguna subcarpeta en esa ruta. Revisa el "
+                        "`GITHUB_DATA_PREFIX`: si lo copiaste del árbol de GitHub, "
+                        "quita los espacios (debe ser `carpeta/subcarpeta/data`, "
+                        "sin espacios después de la barra)."
+                    )
+            except Exception as e:
+                st.caption(f"No se pudo verificar la carpeta: {e}")
     else:
         st.info("🟡 Guardado **local**: en la nube estos archivos son temporales "
                 "(se pierden al reiniciar). Para que queden permanentes, configura los "
@@ -4892,7 +5083,8 @@ def pagina_cargar():
             try:
                 if modo_github:
                     gh_guardar(sub, archivo.name, archivo.getvalue(), reemplazar=reemplaza)
-                    st.success(f"{sub} guardado en GitHub: {archivo.name}. "
+                    st.success(f"{sub} guardado en GitHub: `{gh_prefijo()}/{sub}/"
+                               f"{archivo.name}`. "
                                "La app se actualizará sola en ~1 minuto.")
                 else:
                     guardar_local(carpeta, archivo, reemplazar=reemplaza)
@@ -4976,8 +5168,16 @@ APP_PASSWORD       = "una-clave-secreta"
 GITHUB_TOKEN       = "github_pat_xxxxxxxx"
 GITHUB_REPO        = "usuario/repositorio"
 GITHUB_BRANCH      = "main"
-GITHUB_DATA_PREFIX = "ruta/a/la/carpeta/data"
+GITHUB_DATA_PREFIX = "mrp-panel-enaex/mrp-panel-enaex/data"
 ```
+
+⚠️ **Ojo con `GITHUB_DATA_PREFIX`:** debe ir **sin espacios**. El árbol de
+archivos de GitHub muestra las carpetas anidadas como `carpeta/ subcarpeta`
+(con un espacio después de la barra); si copias eso tal cual, GitHub crea una
+**carpeta nueva** en vez de escribir en la que ya existe. La app ahora limpia
+los espacios y busca sola la carpeta de datos correcta, pero conviene dejar el
+secret bien escrito. Puedes verificar la ruta final en la página
+**📥 Cargar archivos → «¿Dónde se guardan exactamente?»**.
 
 El token se crea en GitHub → Settings → Developer settings → Personal access
 tokens → Fine-grained tokens, con permiso **Contents: Read and write** sobre el
