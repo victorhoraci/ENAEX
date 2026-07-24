@@ -115,6 +115,12 @@ METODO_POR_TIPO = {
 #     (tiempo hasta la próxima demanda estimado en días)
 MIN_DEMANDAS_PR = 3
 
+# Estado del parámetro de inventario. Un material desactualizado pasa a
+# "Cambiar parámetros" cuando su demanda proyectada ya alcanza o supera el stock
+# de seguridad actual del MRP y además tiene MÁS de MIN_DEMANDAS_CAMBIO demandas
+# históricas (o sea, 5 o más meses con consumo).
+MIN_DEMANDAS_CAMBIO = 4
+
 # Para expresar en DÍAS los intervalos que el modelo calcula en meses.
 DIAS_POR_MES = 30
 
@@ -145,6 +151,7 @@ config = types.SimpleNamespace(
     FECHA_INICIO=FECHA_INICIO, ALFA=ALFA, CLASES_MOVIMIENTO=CLASES_MOVIMIENTO,
     CORTE_ADI=CORTE_ADI, CORTE_CV2=CORTE_CV2, METODO_POR_TIPO=METODO_POR_TIPO,
     MIN_DEMANDAS_PR=MIN_DEMANDAS_PR, DIAS_POR_MES=DIAS_POR_MES,
+    MIN_DEMANDAS_CAMBIO=MIN_DEMANDAS_CAMBIO,
     MIN_EVENTOS=MIN_EVENTOS, Z_95=Z_95, HORIZONTE=HORIZONTE,
     COLOR_ENTRADA=COLOR_ENTRADA, COLOR_DEMANDA=COLOR_DEMANDA, COLOR_STOCK=COLOR_STOCK,
 )
@@ -2112,10 +2119,31 @@ def calcular_parametros(demanda_df: pd.DataFrame | None = None) -> pd.DataFrame:
                 PR_Media_Intervalo.
     """
     # --- Demanda (del pipeline de pronóstico) ---
+    clasif = None
     if demanda_df is None:
-        demanda_df = construir().resultado.copy()
+        _res = construir()
+        demanda_df = _res.resultado.copy()
+        clasif = _res.clasificacion.copy()
     dem = demanda_df.copy()
     dem["Material"] = _norm_codigo(dem["Material"])
+
+    # Nº de demandas históricas (meses con consumo). No viene en el resultado del
+    # pronóstico, así que se trae de la clasificación de demanda. Se necesita
+    # para decidir qué materiales pasan a "Cambiar parámetros".
+    if "Meses_con_demanda" not in dem.columns:
+        if clasif is None:
+            try:
+                clasif = construir().clasificacion.copy()
+            except Exception:
+                clasif = None
+        if clasif is not None and "Meses_con_demanda" in clasif.columns:
+            cl = clasif.copy()
+            cl["Material"] = _norm_codigo(cl["Material"])
+            llaves = [k for k in ("Material", "Centro")
+                      if k in cl.columns and k in dem.columns]
+            dem = dem.merge(cl[llaves + ["Meses_con_demanda"]], on=llaves, how="left")
+        else:
+            dem["Meses_con_demanda"] = np.nan
 
     # Pronóstico consolidado: nombre puede variar
     col_pron = next((c for c in ["Pronostico consolidado", "Pronostico_Consolidado",
@@ -2137,6 +2165,7 @@ def calcular_parametros(demanda_df: pd.DataFrame | None = None) -> pd.DataFrame:
         "d": dem["d"],
         "sigma_d": dem["sigma_d"],
         "PR_Media_Intervalo": inter,
+        "Meses_con_demanda": pd.to_numeric(dem.get("Meses_con_demanda"), errors="coerce"),
     })
 
     # --- MM60: ABC, precio, nacionalidad ---
@@ -2274,13 +2303,29 @@ def parametros_vs_mrp(mrp_df: pd.DataFrame | None = None,
         pd.to_numeric(out.get("SS_MRP"), errors="coerce")
 
     # ¿Está desactualizado? (el SS del MRP difiere del SS calculado)
-    def _desactualizado(row):
+    #
+    # Los desactualizados se separan en DOS grupos, porque no todos tienen la
+    # misma urgencia:
+    #   · "Cambiar parámetros" -> la demanda proyectada ya alcanza o supera el
+    #     stock de seguridad que hoy tiene el MRP (d >= SS_MRP) Y el material
+    #     tiene historial suficiente (más de MIN_DEMANDAS_CAMBIO demandas).
+    #     Son los que hay que corregir sí o sí: el parámetro se queda corto y
+    #     además hay historia que respalda el cambio.
+    #   · "Desactualizado" -> difiere del calculado, pero sin esas dos condiciones.
+    def _estado_parametro(row):
         ss_calc = row.get("SS_60")
         ss_mrp = row.get("SS_MRP")
         if pd.isna(ss_calc) or pd.isna(ss_mrp):
             return "Sin dato"
-        return "Desactualizado" if ss_calc != ss_mrp else "Al día"
-    out["Estado parámetro"] = out.apply(_desactualizado, axis=1)
+        if ss_calc == ss_mrp:
+            return "Al día"
+        d = pd.to_numeric(row.get("d"), errors="coerce")
+        n_dem = pd.to_numeric(row.get("Meses_con_demanda"), errors="coerce")
+        if (pd.notna(d) and pd.notna(n_dem)
+                and d >= ss_mrp and n_dem > MIN_DEMANDAS_CAMBIO):
+            return "Cambiar parámetros"
+        return "Desactualizado"
+    out["Estado parámetro"] = out.apply(_estado_parametro, axis=1)
 
     return out.reset_index(drop=True)
 
@@ -2999,6 +3044,8 @@ COLOR_CUMPLE = {"Cumple": "#27AE60", "Alerta": "#F39C12", "Urgente": "#E67E22",
                 "Sin stock dato": "#B0BEC5"}
 COLOR_NAC = {"Nacional": "#2E86DE", "Internacional": "#8E44AD",
              "Otro": "#95A5A6", "Sin OC": "#CFD8DC"}
+COLOR_ESTADO_PARAM = {"Cambiar parámetros": "#C0392B", "Desactualizado": "#F39C12",
+                      "Al día": "#27AE60", "Sin dato": "#B0BEC5"}
 
 
 # ==========================================================================
@@ -3096,13 +3143,14 @@ def aplicar_filtro(datos, col, seleccion):
 
 
 def buscar_en_tabla(df, key, etiqueta="🔎 Buscar material (código o nombre)",
-                    cols=("Material", "Texto breve de material", "Descripción")):
+                    cols=("Material", "Texto breve de material", "Descripción"),
+                    placeholder="Ej: 20004806 o VALVULA"):
     """
     Caja de búsqueda arriba de una tabla: filtra las filas cuyo código o nombre
     contengan el texto escrito. Devuelve el DataFrame filtrado.
     Busca en las columnas indicadas que existan en el df.
     """
-    texto = st.text_input(etiqueta, key=key, placeholder="Ej: 20004806 o VALVULA")
+    texto = st.text_input(etiqueta, key=key, placeholder=placeholder)
     if not texto or not texto.strip():
         return df
     t = texto.strip().lower()
@@ -3126,12 +3174,14 @@ def buscar_en_tabla(df, key, etiqueta="🔎 Buscar material (código o nombre)",
 #  ambas muestren exactamente las mismas columnas)
 # --------------------------------------------------------------------------
 COLS_PARAMETROS = ["Material", "Descripción", "ABC", "Tipo_demanda", "d",
-                   "TAT_Real_Dias", "SS", "ROP", "SS_60", "ROP_60", "Lote_Compra",
-                   "SS_MRP", "Lote_MRP", "Estado parámetro", "Cambio ROP vs SS-MRP",
+                   "Meses_con_demanda", "TAT_Real_Dias", "SS", "ROP", "SS_60",
+                   "ROP_60", "Lote_Compra", "SS_MRP", "Lote_MRP",
+                   "Estado parámetro", "Cambio ROP vs SS-MRP",
                    "Dif ROP - SS MRP", "Motivo_SS"]
 
 RENOMBRE_PARAMETROS = {
     "d": "Demanda esperada", "TAT_Real_Dias": "TAT real (días)",
+    "Meses_con_demanda": "Demandas históricas",
     "SS": "SS real", "ROP": "ROP real", "SS_60": "SS sugerido",
     "ROP_60": "ROP sugerido", "Lote_Compra": "Lote sugerido",
     "SS_MRP": "SS actual (MRP)", "Lote_MRP": "Lote actual (MRP)",
@@ -4693,28 +4743,48 @@ def pagina_parametros():
         return
 
     # ---------------- KPIs ----------------
+    cambiar = int((datos["Estado parámetro"] == "Cambiar parámetros").sum())
     desact = int((datos["Estado parámetro"] == "Desactualizado").sum())
+    al_dia = int((datos["Estado parámetro"] == "Al día").sum())
     sube = int((datos["Cambio ROP vs SS-MRP"] == "Sube").sum())
     baja = int((datos["Cambio ROP vs SS-MRP"] == "Baja").sum())
-    k = st.columns(4)
+    k = st.columns(5)
     k[0].metric("Materiales", f"{len(datos):,}".replace(",", "."))
-    k[1].metric("Desactualizados", desact,
-                help="El stock de seguridad del MRP difiere del calculado")
-    k[2].metric("ROP sube vs SS-MRP", sube,
+    k[1].metric("🔴 Cambiar parámetros", cambiar,
+                help=f"Demanda proyectada ≥ stock de seguridad del MRP y más de "
+                     f"{MIN_DEMANDAS_CAMBIO} demandas históricas")
+    k[2].metric("🟠 Desactualizados", desact,
+                help="El stock de seguridad del MRP difiere del calculado, "
+                     "pero no cumple las dos condiciones anteriores")
+    k[3].metric("ROP sube vs SS-MRP", sube,
                 help="El nuevo punto de reorden es mayor que el stock de seguridad actual")
-    k[3].metric("ROP baja vs SS-MRP", baja,
+    k[4].metric("ROP baja vs SS-MRP", baja,
                 help="El nuevo punto de reorden es menor que el stock de seguridad actual")
+
+    st.info(
+        f"**Cómo se clasifica cada material:**  \n"
+        f"🔴 **Cambiar parámetros** — el SS del MRP difiere del calculado, la "
+        f"**demanda proyectada es ≥ al stock de seguridad actual** y el material "
+        f"tiene **más de {MIN_DEMANDAS_CAMBIO} demandas históricas**. Son los "
+        f"prioritarios: el parámetro se queda corto y hay historia que lo respalda.  \n"
+        f"🟠 **Desactualizado** — el SS del MRP difiere del calculado, pero no "
+        f"cumple las dos condiciones anteriores.  \n"
+        f"🟢 **Al día** — el SS del MRP coincide con el calculado."
+    )
 
     st.markdown("---")
 
     # ---------------- Gráficos ----------------
     g1, g2 = st.columns(2)
     with g1:
-        conteo = {"Desactualizado": desact,
-                  "Al día": int((datos["Estado parámetro"] == "Al día").sum())}
-        st.plotly_chart(barras(conteo,
-                               {"Desactualizado": "#E74C3C", "Al día": "#27AE60"},
-                               "Materiales desactualizados vs al día"),
+        conteo = {"Cambiar parámetros": cambiar,
+                  "Desactualizado": desact,
+                  "Al día": al_dia}
+        sin_dato = int((datos["Estado parámetro"] == "Sin dato").sum())
+        if sin_dato:
+            conteo["Sin dato"] = sin_dato
+        st.plotly_chart(barras(conteo, COLOR_ESTADO_PARAM,
+                               "Estado del parámetro de inventario"),
                         use_container_width=True)
     with g2:
         orden = ["Sube", "Baja", "Igual", "Sin comparación"]
@@ -4757,6 +4827,18 @@ def pagina_parametros():
         c[1].metric("Lote en el MRP", "—" if pd.isna(info.get("Lote_MRP")) else f"{info['Lote_MRP']:.0f}")
         c[2].metric("Estado", str(info.get("Estado parámetro", "—")))
         c[3].metric("ROP vs SS-MRP", str(info.get("Cambio ROP vs SS-MRP", "—")))
+
+        # Por qué quedó en ese estado
+        n_dem = pd.to_numeric(info.get("Meses_con_demanda"), errors="coerce")
+        d_val = pd.to_numeric(info.get("d"), errors="coerce")
+        ss_mrp_val = pd.to_numeric(info.get("SS_MRP"), errors="coerce")
+        cond_d = (pd.notna(d_val) and pd.notna(ss_mrp_val) and d_val >= ss_mrp_val)
+        cond_n = (pd.notna(n_dem) and n_dem > MIN_DEMANDAS_CAMBIO)
+        st.caption(
+            f"Demandas históricas: **{'—' if pd.isna(n_dem) else int(n_dem)}** "
+            f"({'✅' if cond_n else '❌'} más de {MIN_DEMANDAS_CAMBIO})  ·  "
+            f"Demanda proyectada ≥ SS del MRP: {'✅' if cond_d else '❌'}"
+        )
         st.caption(f"Motivo del cálculo de SS: {info.get('Motivo_SS', '—')}")
 
     st.markdown("---")
@@ -4873,6 +4955,127 @@ def pagina_proveedores():
                     xaxis=dict(title="TAT promedio (días)"), yaxis=dict(title="OTIF (%)"))
                 st.plotly_chart(fig, use_container_width=True)
 
+        # ================= HISTÓRICO DE GASTO Y FICHA DEL PROVEEDOR =========
+        st.markdown("---")
+        st.markdown("#### 📈 Histórico de gasto en proveedores")
+
+        cols_clp_anio = sorted(
+            [c for c in prov.columns
+             if c.startswith("CLP ") and c.split()[-1].isdigit()],
+            key=lambda c: int(c.split()[-1]))
+        anios_clp = [int(c.split()[-1]) for c in cols_clp_anio]
+
+        if not cols_clp_anio:
+            st.info("No hay gasto en CLP por año para graficar el histórico.")
+        else:
+            # --- Evolución del gasto: top proveedores + resto ---
+            top_n = prov.nlargest(10, "CLP total") if "CLP total" in prov.columns \
+                else prov.head(10)
+            resto = prov[~prov.index.isin(top_n.index)]
+
+            fig = go.Figure()
+            for _, r in top_n.iterrows():
+                fig.add_trace(go.Bar(
+                    name=str(r["Proveedor_Nombre"])[:30],
+                    x=anios_clp,
+                    y=[0 if pd.isna(r.get(c)) else float(r.get(c)) for c in cols_clp_anio],
+                    hovertemplate="%{fullData.name}<br>%{x}: %{y:,.0f} CLP<extra></extra>"))
+            if not resto.empty:
+                fig.add_trace(go.Bar(
+                    name=f"Otros ({len(resto)} proveedores)",
+                    x=anios_clp,
+                    y=[float(resto[c].sum(skipna=True)) for c in cols_clp_anio],
+                    marker_color="#B0BEC5",
+                    hovertemplate="Otros<br>%{x}: %{y:,.0f} CLP<extra></extra>"))
+            fig.update_layout(
+                barmode="stack",
+                title="Gasto por año (CLP) — top 10 proveedores y resto",
+                height=460, margin=dict(l=10, r=10, t=45, b=10),
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                xaxis=dict(title="Año", type="category"),
+                yaxis=dict(title="Gasto (CLP)"),
+                legend=dict(orientation="h", y=-0.18, font=dict(size=10)))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Cada color es un proveedor. La altura total de la barra es "
+                       "el gasto de ese año en CLP.")
+
+            # --- Ficha de un proveedor ---
+            st.markdown("#### 🔍 Ver un proveedor en detalle")
+            prov_f = prov.copy()
+            prov_f["etiqueta"] = (prov_f["Proveedor_Codigo"].astype(str) + "  —  "
+                                  + prov_f["Proveedor_Nombre"].astype(str))
+            sel_prov = st.selectbox("Buscar proveedor (código o nombre)",
+                                    ["(ninguno)"] + prov_f["etiqueta"].tolist(),
+                                    key="prov_ficha")
+
+            if sel_prov != "(ninguno)":
+                rp = prov_f[prov_f["etiqueta"] == sel_prov].iloc[0]
+
+                # Gasto de los últimos 2 años con datos
+                ult2 = cols_clp_anio[-2:]
+                gasto_2a = sum(0 if pd.isna(rp.get(c)) else float(rp.get(c)) for c in ult2)
+                etiq_2a = " y ".join(str(int(c.split()[-1])) for c in ult2)
+
+                tat_v = rp.get("TAT_prom")
+                otif_v = rp.get("OTIF")
+                cm_v = str(rp.get("Contrato marco", "—"))
+
+                n_mat = pd.to_numeric(rp.get("Materiales"), errors="coerce")
+                n_com = pd.to_numeric(rp.get("Compras"), errors="coerce")
+                st.markdown(f"### {rp['Proveedor_Nombre']}")
+                st.caption(f'Código <span class="mono">{rp["Proveedor_Codigo"]}</span>  ·  '
+                           f'{0 if pd.isna(n_mat) else int(n_mat)} materiales  ·  '
+                           f'{0 if pd.isna(n_com) else int(n_com)} compras',
+                           unsafe_allow_html=True)
+
+                f1, f2, f3, f4 = st.columns(4)
+                with f1:
+                    st.markdown(_card(
+                        "TAT promedio",
+                        "—" if pd.isna(tat_v) else f"{tat_v:.0f} días",
+                        "tiempo de abastecimiento"), unsafe_allow_html=True)
+                with f2:
+                    st.markdown(_card(
+                        "Contrato marco",
+                        f'<span style="color:{"#27AE60" if cm_v == "Sí" else "#C0392B"}">'
+                        f'{cm_v}</span>',
+                        "vigente con el proveedor"), unsafe_allow_html=True)
+                with f3:
+                    st.markdown(_card(
+                        "OTIF",
+                        "—" if pd.isna(otif_v) else f"{otif_v:.1f}%",
+                        "entregas a tiempo y completas"), unsafe_allow_html=True)
+                with f4:
+                    st.markdown(_card(
+                        f"Gasto últimos 2 años",
+                        _fmt_clp(gasto_2a),
+                        f"CLP · {etiq_2a}"), unsafe_allow_html=True)
+
+                st.markdown("")
+                # Gasto histórico de ESTE proveedor
+                valores = [0 if pd.isna(rp.get(c)) else float(rp.get(c)) for c in cols_clp_anio]
+                colores = ["#2E86DE" if c not in ult2 else "#1B4F72" for c in cols_clp_anio]
+                figp = go.Figure(go.Bar(
+                    x=[str(a) for a in anios_clp], y=valores, marker_color=colores,
+                    text=[_fmt_clp(v) for v in valores], textposition="outside"))
+                figp.update_layout(
+                    title=f"Gasto histórico en {rp['Proveedor_Nombre']} (CLP)",
+                    height=360, margin=dict(l=10, r=10, t=45, b=10),
+                    plot_bgcolor="#fff", paper_bgcolor="#fff",
+                    xaxis=dict(title="Año"), yaxis=dict(title="Gasto (CLP)"))
+                st.plotly_chart(figp, use_container_width=True)
+
+                # Otras monedas, si las hubo
+                otras = [c for c in prov.columns
+                         if any(c.startswith(f"{m} ") for m in ("USD", "EUR", "UF", "GBP"))
+                         and c.split()[-1].isdigit()
+                         and pd.notna(rp.get(c)) and float(rp.get(c) or 0) != 0]
+                if otras:
+                    st.caption("Compras en otras monedas: "
+                               + "  ·  ".join(f"**{c}**: {_fmt_clp(rp[c])}"
+                                              for c in sorted(otras)))
+
+        st.markdown("---")
         st.markdown("#### Todos los proveedores — gasto por año y moneda")
         st.caption("Cada año y moneda (CLP, USD, EUR, UF, GBP) es una columna. "
                    "Además: OTIF, TAT promedio, materiales, contrato marco. "
@@ -4933,7 +5136,15 @@ def pagina_proveedores():
             cols = [c for c in cols if c in datos_m.columns]
             vista_m = datos_m[cols].rename(columns={
                 "Criticidad texto": "Criticidad", "Grupo de compras": "Grupo compra"})
-            vista_m = buscar_en_tabla(vista_m, "buscar_matc", cols=("Material", "Descripción"))
+            vista_m = buscar_en_tabla(
+                vista_m, "buscar_matc",
+                etiqueta="🔎 Buscar por material **o proveedor** (código o nombre)",
+                cols=("Material", "Descripción", "Proveedores",
+                      "Proveedor del contrato"),
+                placeholder="Ej: 20004806 · VALVULA · 436832 · NICRIS")
+            st.caption("La búsqueda mira el código y el nombre del material, y "
+                       "también los proveedores de cada compra (incluido el del "
+                       "contrato marco).")
             vista_fmt = vista_m.copy()
             for c in [c for c in vista_fmt.columns if c.startswith("Costo ")]:
                 vista_fmt[c] = vista_fmt[c].apply(_fmt_clp)
