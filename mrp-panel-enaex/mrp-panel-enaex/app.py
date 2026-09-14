@@ -4523,22 +4523,53 @@ def pagina_control():
         st.plotly_chart(barras(conteo, COLOR_COND, "Estado actual del stock"),
                         use_container_width=True)
 
-    # ---------------- Materiales críticos ----------------
+
+    # ---------------- Materiales críticos con filtros interactivos ----------------
     st.markdown("#### 🚨 Materiales que necesitan acción")
     st.caption("No alcanzan a cubrir su próxima demanda (**No cumple**), o quedan "
                "en quiebre (**Urgente**) o bajo stock (**Alerta**) después de atenderla.")
-    criticos = datos[datos["Resultado demanda"].isin(["No cumple", "Urgente", "Alerta"])]
-    if criticos.empty:
+    
+    criticos_base = datos[datos["Resultado demanda"].isin(["No cumple", "Urgente", "Alerta"])].copy()
+    
+    if criticos_base.empty:
         st.success("Todos los materiales con pronóstico cubren su próxima demanda.")
     else:
-        criticos = criticos.copy()
-        # Columna nueva: qué tan urgente es gestionar, según TAT vs tiempo a la demanda.
-        # Va justo al lado de "Gestión".
-        if "Acción de compra" in criticos.columns:
-            criticos["Gestionar según TAT"] = criticos["Acción de compra"].map(_gestion_tat_label)
+        # Calcular etiqueta visual de TAT
+        if "Acción de compra" in criticos_base.columns:
+            criticos_base["Gestionar según TAT"] = criticos_base["Acción de compra"].map(_gestion_tat_label)
+        else:
+            criticos_base["Gestionar según TAT"] = "—"
 
-        # Columnas de la tabla de críticos: se quitan Área, TAT mín. y TAT máx.,
-        # y se inserta la columna nueva justo después de "Estado gestión".
+        # --- BARRA DE FILTROS RÁPIDOS ---
+        f_col1, f_col2 = st.columns([1.5, 2.5])
+        
+        with f_col1:
+            sel_crit_filtro = st.selectbox(
+                "Filtrar por Criticidad",
+                ["Todas", "Alta", "Baja", "Sin criticidad"],
+                index=0,
+                key="filtro_rapido_crit"
+            )
+        
+        with f_col2:
+            sel_tat_filtro = st.radio(
+                "Filtrar por Gestión TAT",
+                ["Todos los estados", "🔴 Solo 'Gestionar ya'"],
+                horizontal=True,
+                key="filtro_rapido_tat"
+            )
+
+        # Aplicar filtros interactivos sobre el conjunto crítico
+        criticos = criticos_base.copy()
+        if sel_crit_filtro != "Todas":
+            criticos = criticos[criticos["Criticidad texto"] == sel_crit_filtro]
+        
+        if "Solo 'Gestionar ya'" in sel_tat_filtro:
+            criticos = criticos[criticos["Gestionar según TAT"].astype(str).str.contains("Gestionar ya", na=False)]
+
+        st.caption(f"Mostrando **{len(criticos)}** de **{len(criticos_base)}** materiales con necesidad de acción.")
+
+        # Ordenar columnas para la vista
         cols_crit = [c for c in COLS_CONTROL if c not in ("Area", "TAT Min", "TAT Max")]
         if "Estado gestión" in cols_crit and "Gestionar según TAT" in criticos.columns:
             cols_crit.insert(cols_crit.index("Estado gestión") + 1, "Gestionar según TAT")
@@ -4547,16 +4578,17 @@ def pagina_control():
         renombre_c = dict(RENOMBRE_CONTROL)
         renombre_c["Gestionar según TAT"] = "¿Cuándo gestionar? (TAT)"
         vista_c = criticos[cols].rename(columns=renombre_c)
+        
         orden_urg = {"No cumple": 0, "Urgente": 1, "Alerta": 2}
         vista_c = vista_c.assign(_o=criticos["Resultado demanda"].map(orden_urg).values) \
                          .sort_values(["_o", "Descripción"]).drop(columns="_o")
-        # Añadir 5 proveedores sugeridos al final de cada fila (nombre y OTIF; sin
-        # el TAT por proveedor, según lo pedido). Solo tiene sentido para los que
-        # aún no tienen OC/solped en curso.
+        
+        # Agregar sugerencias de proveedores históricos
         vista_c = agregar_proveedores_a_tabla(vista_c, "Material", top=5, incluir_tat=False)
         st.caption("Al final de cada fila se proponen hasta **5 proveedores** del "
                    "historial (nombre y OTIF), de mejor a peor por TAT. "
                    "Desplázate a la derecha para verlos.")
+        
         vista_c = buscar_en_tabla(vista_c, "buscar_ctl_crit")
         st.dataframe(vista_c, use_container_width=True, hide_index=True)
         st.download_button("⬇️  Descargar materiales críticos (CSV)",
