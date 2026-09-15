@@ -1372,7 +1372,10 @@ def cargar_mrp(ruta=None) -> pd.DataFrame:
         "Proveedor": ("Proveedor",),
         "Fecha de entrega": ("Fecha de entrega",),
         "Usuario": ("Usuario",),
-        "Observación": ("Observación", "Observacion"),
+        "Observación": (
+            "Observación", "Observacion",
+            "Observación MRP", "Observacion MRP",
+            "Observación  MRP", "Observacion  MRP"),
         # Nueva columna del Planificación SIMPL: comentario de compra y
         # seguimiento. Va al final, junto a la Observación. Se aceptan varias
         # variantes de nombre por si el encabezado cambia levemente.
@@ -1857,7 +1860,7 @@ def _gestion_tat_label(accion) -> str:
         return "🟠 Gestionar pronto"
     if a.startswith("Pedir en"):
         return "🟢 Hay tiempo"
-    return "—"
+    return "🟡 Verificar"
 
 
 def _accion_tat(dias_hasta_demanda, tat_promedio, resultado, margen=20):
@@ -4523,22 +4526,56 @@ def pagina_control():
         st.plotly_chart(barras(conteo, COLOR_COND, "Estado actual del stock"),
                         use_container_width=True)
 
-    # ---------------- Materiales críticos ----------------
+    st.markdown("---")
+    st.markdown("<div style='margin-bottom: 12px;'></div>", unsafe_allow_html=True)
+
+    # ---------------- Materiales críticos con filtros interactivos ----------------
     st.markdown("#### 🚨 Materiales que necesitan acción")
     st.caption("No alcanzan a cubrir su próxima demanda (**No cumple**), o quedan "
                "en quiebre (**Urgente**) o bajo stock (**Alerta**) después de atenderla.")
-    criticos = datos[datos["Resultado demanda"].isin(["No cumple", "Urgente", "Alerta"])]
-    if criticos.empty:
+    
+    criticos_base = datos[datos["Resultado demanda"].isin(["No cumple", "Urgente", "Alerta"])].copy()
+    
+    if criticos_base.empty:
         st.success("Todos los materiales con pronóstico cubren su próxima demanda.")
     else:
-        criticos = criticos.copy()
-        # Columna nueva: qué tan urgente es gestionar, según TAT vs tiempo a la demanda.
-        # Va justo al lado de "Gestión".
-        if "Acción de compra" in criticos.columns:
-            criticos["Gestionar según TAT"] = criticos["Acción de compra"].map(_gestion_tat_label)
+        # Calcular etiqueta visual de TAT
+        if "Acción de compra" in criticos_base.columns:
+            criticos_base["Gestionar según TAT"] = criticos_base["Acción de compra"].map(_gestion_tat_label)
+        else:
+            criticos_base["Gestionar según TAT"] = "🟡 Verificar"
 
-        # Columnas de la tabla de críticos: se quitan Área, TAT mín. y TAT máx.,
-        # y se inserta la columna nueva justo después de "Estado gestión".
+        # --- BARRA DE FILTROS RÁPIDOS SIMÉTRICOS ---
+        f_col1, f_col2 = st.columns(2)
+        
+        with f_col1:
+            sel_crit_filtro = st.selectbox(
+                "Filtrar por Criticidad",
+                ["Todas", "Alta", "Baja", "Sin criticidad"],
+                index=0,
+                key="filtro_rapido_crit"
+            )
+        
+        with f_col2:
+            sel_tat_filtro = st.selectbox(
+                "Filtrar por Gestión TAT",
+                ["Todos los estados", "🔴 Gestionar ya", "🟠 Gestionar pronto", "🟢 Hay tiempo", "🟡 Verificar"],
+                index=0,
+                key="filtro_rapido_tat"
+            )
+
+        # Aplicar filtros interactivos sobre el conjunto crítico
+        criticos = criticos_base.copy()
+        if sel_crit_filtro != "Todas":
+            criticos = criticos[criticos["Criticidad texto"] == sel_crit_filtro]
+        
+        if sel_tat_filtro != "Todos los estados":
+            estado_limpio = sel_tat_filtro.split(" ", 1)[-1]
+            criticos = criticos[criticos["Gestionar según TAT"].astype(str).str.contains(estado_limpio, na=False)]
+
+        st.caption(f"Mostrando **{len(criticos)}** de **{len(criticos_base)}** materiales con necesidad de acción.")
+
+        # Ordenar columnas para la vista
         cols_crit = [c for c in COLS_CONTROL if c not in ("Area", "TAT Min", "TAT Max")]
         if "Estado gestión" in cols_crit and "Gestionar según TAT" in criticos.columns:
             cols_crit.insert(cols_crit.index("Estado gestión") + 1, "Gestionar según TAT")
@@ -4547,18 +4584,34 @@ def pagina_control():
         renombre_c = dict(RENOMBRE_CONTROL)
         renombre_c["Gestionar según TAT"] = "¿Cuándo gestionar? (TAT)"
         vista_c = criticos[cols].rename(columns=renombre_c)
+        
         orden_urg = {"No cumple": 0, "Urgente": 1, "Alerta": 2}
         vista_c = vista_c.assign(_o=criticos["Resultado demanda"].map(orden_urg).values) \
                          .sort_values(["_o", "Descripción"]).drop(columns="_o")
-        # Añadir 5 proveedores sugeridos al final de cada fila (nombre y OTIF; sin
-        # el TAT por proveedor, según lo pedido). Solo tiene sentido para los que
-        # aún no tienen OC/solped en curso.
+        
         vista_c = agregar_proveedores_a_tabla(vista_c, "Material", top=5, incluir_tat=False)
         st.caption("Al final de cada fila se proponen hasta **5 proveedores** del "
                    "historial (nombre y OTIF), de mejor a peor por TAT. "
                    "Desplázate a la derecha para verlos.")
+        
         vista_c = buscar_en_tabla(vista_c, "buscar_ctl_crit")
-        st.dataframe(vista_c, use_container_width=True, hide_index=True)
+
+        # Pintar filas con tinte suave según urgencia; 'Verificar' queda sin fondo
+        def _colorear_por_tat(row):
+            val = str(row.get("¿Cuándo gestionar? (TAT)", ""))
+            if "Gestionar ya" in val:
+                bg = "background-color: rgba(231, 76, 60, 0.12);"   # Rojo pastel suave
+            elif "Gestionar pronto" in val:
+                bg = "background-color: rgba(243, 156, 18, 0.14);"  # Naranja suave
+            elif "Hay tiempo" in val:
+                bg = "background-color: rgba(39, 174, 96, 0.12);"   # Verde pastel suave
+            else:
+                bg = ""
+            return [bg] * len(row)
+
+        vista_estilizada = vista_c.style.apply(_colorear_por_tat, axis=1)
+        st.dataframe(vista_estilizada, use_container_width=True, hide_index=True)
+        
         st.download_button("⬇️  Descargar materiales críticos (CSV)",
                            data=vista_c.to_csv(index=False).encode("utf-8-sig"),
                            file_name="materiales_criticos.csv", mime="text/csv",
