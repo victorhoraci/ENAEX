@@ -68,6 +68,26 @@ CARPETA_ME2M = RAIZ_PROYECTO / "data" / "ME2M"
 CARPETA_TAT = RAIZ_PROYECTO / "data" / "TAT"
 CARPETA_OTIF = RAIZ_PROYECTO / "data" / "OTIF"
 CARPETA_ME2M_HIST = RAIZ_PROYECTO / "data" / "ME2M_HIST"
+# CRITICIDAD -> lista oficial de criticidad por material (Excel "Valorizado y
+# rotación"): columnas Material + Valorizado (Diamante / A / B / C).
+# Si hay un archivo en esta carpeta, REEMPLAZA la criticidad del MRP semanal.
+CARPETA_CRITICIDAD = RAIZ_PROYECTO / "data" / "CRITICIDAD"
+
+
+# --------------------------------------------------------------------------
+# CRITICIDAD DE MATERIALES
+# --------------------------------------------------------------------------
+# Códigos internos (de más a menos crítico) y su nombre en el panel.
+# "D" = Diamante: nueva clase, MÁS crítica que A.
+CRITICIDAD_TEXTO = {"D": "Diamante", "A": "Alta", "B": "Media", "C": "Baja"}
+# Orden en que se muestran las clases en filtros, tablas y gráficos.
+ORDEN_CRITICIDAD = ["Diamante", "Alta", "Media", "Baja", "Sin criticidad"]
+COLOR_CRITICIDAD = {"Diamante": "#8E44AD", "Alta": "#E74C3C", "Media": "#F39C12",
+                    "Baja": "#F1C40F", "Sin criticidad": "#BDC3C7"}
+# Materiales que NO aparecen en la lista de criticidad:
+#   False -> quedan "Sin criticidad" (la lista nueva manda en todo).
+#   True  -> conservan la criticidad que traiga el MRP semanal.
+CRITICIDAD_MANTENER_MRP_SI_FALTA = False
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +168,8 @@ config = types.SimpleNamespace(
     CARPETA_ME5A=CARPETA_ME5A, CARPETA_ME2M=CARPETA_ME2M,
     CARPETA_TAT=CARPETA_TAT,
     CARPETA_OTIF=CARPETA_OTIF, CARPETA_ME2M_HIST=CARPETA_ME2M_HIST,
+    CARPETA_CRITICIDAD=CARPETA_CRITICIDAD,
+    CRITICIDAD_MANTENER_MRP_SI_FALTA=CRITICIDAD_MANTENER_MRP_SI_FALTA,
     FECHA_INICIO=FECHA_INICIO, ALFA=ALFA, CLASES_MOVIMIENTO=CLASES_MOVIMIENTO,
     CORTE_ADI=CORTE_ADI, CORTE_CV2=CORTE_CV2, METODO_POR_TIPO=METODO_POR_TIPO,
     MIN_DEMANDAS_PR=MIN_DEMANDAS_PR, DIAS_POR_MES=DIAS_POR_MES,
@@ -1329,6 +1351,79 @@ def _etiqueta_semana(fecha) -> str | None:
     return f"{iso[0]}-S{int(iso[1]):02d}"
 
 
+def _codigo_criticidad(valor) -> str:
+    """
+    Lleva cualquier forma de escribir la criticidad a su código interno:
+    'Diamante' / 'D' -> 'D' · 'A'/'Alta' -> 'A' · 'B'/'Media' -> 'B' ·
+    'C'/'Baja' -> 'C' · cualquier otra cosa (vacío, '-', '#N/A') -> ''.
+    """
+    v = str(valor if valor is not None else "").strip().upper()
+    if v in ("", "NAN", "NONE"):
+        return ""
+    if v in ("D", "DIAMANTE"):
+        return "D"
+    if v in ("A", "ALTA"):
+        return "A"
+    if v in ("B", "MEDIA"):
+        return "B"
+    if v in ("C", "BAJA"):
+        return "C"
+    return ""
+
+
+def cargar_criticidad(ruta=None) -> pd.DataFrame:
+    """
+    Lista oficial de criticidad por material (Excel "Valorizado y rotación").
+
+    Busca la fila donde está el encabezado 'Material' y lee las columnas
+    Material + Valorizado (la criticidad: Diamante, A, B, C). Si trae la columna
+    'Rotación' también la conserva. Llave: Material (sin centro).
+    Devuelve columnas: Material, Criticidad (código D/A/B/C), Rotación.
+    """
+    ruta = ruta or config.CARPETA_CRITICIDAD
+    archivos = _listar_excels(ruta)
+    if not archivos:
+        raise FileNotFoundError(f"No se encontró la lista de criticidad en: {ruta}")
+    a = archivos[-1]  # si hubiera más de uno, manda el último (orden alfabético)
+    xls = pd.ExcelFile(a)
+    hoja = xls.sheet_names[0]
+    fila = _fila_encabezado_archivo(a, hoja)
+    df = pd.read_excel(a, sheet_name=hoja, header=fila)
+    df = _renombrar(df, {
+        "Material": ("Material",),
+        "Criticidad": ("Valorizado", "Criticidad", "Criticidad nueva",
+                       "Clasificación", "Clasificacion"),
+        "Rotación": ("Rotación", "Rotacion"),
+    })
+    if "Material" not in df.columns or "Criticidad" not in df.columns:
+        raise ValueError(f"'{a.name}' debe traer las columnas Material y Valorizado.")
+    df = df.dropna(subset=["Material"])
+    df["Material"] = _norm_codigo(df["Material"])
+    df["Criticidad"] = df["Criticidad"].map(_codigo_criticidad)
+    cols = [c for c in ["Material", "Criticidad", "Rotación"] if c in df.columns]
+    return df[cols].drop_duplicates(subset=["Material"], keep="last").reset_index(drop=True)
+
+
+def _aplicar_criticidad_oficial(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reemplaza la columna Criticidad del MRP por la de la lista oficial
+    (data/CRITICIDAD), cruzando por Material. Se aplica a TODAS las semanas,
+    así el histórico se compara con la misma clasificación.
+    Si no hay lista cargada, deja la criticidad del MRP tal cual.
+    """
+    try:
+        crit = cargar_criticidad()
+    except FileNotFoundError:
+        return df
+    mapa = crit.set_index("Material")["Criticidad"]
+    nueva = df["Material"].map(mapa)
+    if config.CRITICIDAD_MANTENER_MRP_SI_FALTA:
+        df["Criticidad"] = nueva.where(nueva.notna(), df["Criticidad"])
+    else:
+        df["Criticidad"] = nueva.fillna("")
+    return df
+
+
 def cargar_mrp(ruta=None) -> pd.DataFrame:
     """
     MRP semanal: hoja 'data', encabezados donde aparece 'Material'.
@@ -1437,8 +1532,11 @@ def cargar_mrp(ruta=None) -> pd.DataFrame:
             df[c] = _parse_numero(df[c])
     if "Fecha de entrega" in df.columns:
         df["Fecha de entrega"] = _parse_fecha(df["Fecha de entrega"])
-    if "Criticidad" in df.columns:
-        df["Criticidad"] = df["Criticidad"].fillna("").astype(str).str.strip()
+    if "Criticidad" not in df.columns:
+        df["Criticidad"] = ""
+    df["Criticidad"] = df["Criticidad"].fillna("").astype(str).str.strip().map(_codigo_criticidad)
+    # Criticidad oficial (carpeta data/CRITICIDAD): reemplaza la del MRP.
+    df = _aplicar_criticidad_oficial(df)
     # Dedupe DENTRO de cada semana (no entre semanas: el histórico se conserva)
     df = df.drop_duplicates(subset=["Material", "Centro", "Semana"], keep="last")
     return df.sort_values(["Fecha MRP", "Material"]).reset_index(drop=True)
@@ -1665,16 +1763,20 @@ def historial_semanal(mrp=None) -> pd.DataFrame:
             if len(crit):
                 q = int((crit["Condicion Stock"] == "Quiebre Stock").sum())
                 fila["Disponibilidad A"] = round(100 * (len(crit) - q) / len(crit), 2)
-            # conservadora por cada clase (A, B, C)
-            for clase in ["A", "B", "C"]:
-                gc = g[g["Criticidad"] == clase]
+            dia = g[g["Criticidad"] == "D"]
+            if len(dia):
+                q = int((dia["Condicion Stock"] == "Quiebre Stock").sum())
+                fila["Disponibilidad Diamante"] = round(100 * (len(dia) - q) / len(dia), 2)
+            # conservadora por cada clase (Diamante, A, B, C)
+            for codigo, nombre in [("D", "Diamante"), ("A", "A"), ("B", "B"), ("C", "C")]:
+                gc = g[g["Criticidad"] == codigo]
                 if len(gc):
                     okc = int((gc["Condicion Stock"].isin(["Stock OK", "Sobre Stock"])).sum())
-                    fila[f"Disp. conservadora {clase}"] = round(100 * okc / len(gc), 2)
-            # Sin criticidad: materiales cuya Criticidad no es A, B ni C
+                    fila[f"Disp. conservadora {nombre}"] = round(100 * okc / len(gc), 2)
+            # Sin criticidad: materiales cuya Criticidad no es Diamante, A, B ni C
             # (mismo criterio que _criticidad_texto para "Sin criticidad").
-            crit_norm = g["Criticidad"].apply(lambda c: str(c or "").strip().upper())
-            gsc = g[~crit_norm.isin(["A", "B", "C"])]
+            crit_norm = g["Criticidad"].map(_codigo_criticidad)
+            gsc = g[~crit_norm.isin(["D", "A", "B", "C"])]
             if len(gsc):
                 oksc = int((gsc["Condicion Stock"].isin(["Stock OK", "Sobre Stock"])).sum())
                 fila["Disp. conservadora Sin criticidad"] = round(100 * oksc / len(gsc), 2)
@@ -1718,6 +1820,8 @@ def estado_archivos() -> list[dict]:
          "Fecha y entrega de la OC -> días de OC y atrasos."),
         ("TAT (Vista Ejecutiva)", config.CARPETA_TAT, False,
          "Tiempo de abastecimiento por material (hoja Dias_TAT)."),
+        ("Criticidad (Valorizado)", config.CARPETA_CRITICIDAD, False,
+         "Criticidad oficial por material (Diamante, A, B, C). Reemplaza la del MRP."),
     ]
     estado = []
     for nombre, carpeta, obligatorio, para_que in fuentes:
@@ -1747,14 +1851,8 @@ def _nacionalidad_oc(oc) -> str:
 
 
 def _criticidad_texto(c) -> str:
-    c = str(c or "").strip().upper()
-    if c == "A":
-        return "Alta"
-    if c == "C":
-        return "Baja"
-    if c == "B":
-        return "Media"
-    return "Sin criticidad"
+    """Código interno (D/A/B/C) -> nombre en el panel. Otro valor -> Sin criticidad."""
+    return CRITICIDAD_TEXTO.get(_codigo_criticidad(c), "Sin criticidad")
 
 
 def _rango_dias_solped(d):
@@ -2113,6 +2211,10 @@ def construir_abastecimiento(
         if len(crit):
             q = int((crit["Condicion Stock"] == "Quiebre Stock").sum())
             kpis["disponibilidad_A"] = round(100 * (len(crit) - q) / len(crit), 2)
+        dia = base[base["Criticidad"] == "D"]
+        if len(dia):
+            q = int((dia["Condicion Stock"] == "Quiebre Stock").sum())
+            kpis["disponibilidad_Diamante"] = round(100 * (len(dia) - q) / len(dia), 2)
 
     return ResultadoAbastecimiento(tabla=base.reset_index(drop=True), kpis=kpis)
 
@@ -2913,7 +3015,7 @@ def _secret(clave: str, defecto=None):
 # Subcarpetas de datos que debe contener la carpeta correcta del repo.
 # Sirven para reconocerla cuando hay que autodetectarla.
 SUBCARPETAS_DATOS = ("MB51", "MB5B", "MRP", "MM60", "ME5A", "ME2M",
-                     "ME2M_HIST", "TAT", "OTIF")
+                     "ME2M_HIST", "TAT", "OTIF", "CRITICIDAD")
 
 # Memoria de la carpeta ya resuelta, para no consultar la API en cada guardado.
 _PREFIJO_RESUELTO: dict = {}
@@ -3244,7 +3346,8 @@ def _firma_datos() -> tuple:
     """
     carpetas = (config.CARPETA_MRP, config.CARPETA_MM60, config.CARPETA_ME5A,
                 config.CARPETA_ME2M, config.CARPETA_TAT,
-                config.CARPETA_MB51, config.CARPETA_MB5B)
+                config.CARPETA_MB51, config.CARPETA_MB5B,
+                config.CARPETA_CRITICIDAD)
     firma = []
     for carpeta in carpetas:
         try:
@@ -3345,6 +3448,9 @@ def filtro_multi(datos, col, etiqueta, key):
         return None
     vals = datos[col].astype(str).str.strip()
     opciones = sorted(v for v in vals.unique() if v and str(v).lower() != "nan")
+    if col == "Criticidad texto":  # de más a menos crítico, no alfabético
+        opciones = sorted(opciones, key=lambda v: ORDEN_CRITICIDAD.index(v)
+                          if v in ORDEN_CRITICIDAD else len(ORDEN_CRITICIDAD))
     hay_vacios = (vals == "").any() or (vals.str.lower() == "nan").any() or datos[col].isna().any()
     if hay_vacios:
         opciones = opciones + [SIN_DATO]
@@ -3511,6 +3617,8 @@ def estado_archivos_todos():
          "Proveedores y Compras por material: gasto histórico, cantidades, contrato marco."),
         ("OTIF (Activación 2.0)", CARPETA_OTIF, False,
          "Proveedores: cumplimiento In Full y On Time por proveedor."),
+        ("Criticidad (Valorizado)", CARPETA_CRITICIDAD, False,
+         "Criticidad oficial por material (Diamante, A, B, C). Reemplaza la del MRP."),
     ]
     est = []
     for nombre, carpeta, obligatorio, para_que in fuentes:
@@ -3935,11 +4043,9 @@ def pagina_mrp_e002():
         with r2:
             if "Criticidad texto" in datos.columns:
                 conteo = {c: int((datos["Criticidad texto"] == c).sum())
-                          for c in ["Alta", "Media", "Baja", "Sin criticidad"]}
+                          for c in ORDEN_CRITICIDAD}
                 conteo = {a: b for a, b in conteo.items() if b}
-                st.plotly_chart(barras(conteo,
-                                       {"Alta": "#E74C3C", "Media": "#F39C12",
-                                        "Baja": "#F1C40F", "Sin criticidad": "#BDC3C7"},
+                st.plotly_chart(barras(conteo, COLOR_CRITICIDAD,
                                        "Material por criticidad", True),
                                 use_container_width=True)
         with r3:
@@ -4101,7 +4207,9 @@ def pagina_mrp_e002():
         g3, g4 = st.columns(2)
         with g3:
             if "Criticidad texto" in datos:
-                st.plotly_chart(barras(dict(datos["Criticidad texto"].value_counts()), {},
+                cuenta = datos["Criticidad texto"].value_counts()
+                conteo = {c: int(cuenta[c]) for c in ORDEN_CRITICIDAD if c in cuenta}
+                st.plotly_chart(barras(conteo, COLOR_CRITICIDAD,
                                        "Materiales por criticidad"), use_container_width=True)
         with g4:
             if "Rango TAT" in datos:
@@ -4165,7 +4273,9 @@ def pagina_mrp_e002():
             def linea(cols, titulo, eje="Materiales"):
                 fig = go.Figure()
                 colores = {"Disponibilidad": "#27AE60", "Disponibilidad A": "#1565C0",
+                           "Disponibilidad Diamante": "#8E44AD",
                            "Disponibilidad conservadora": "#16A085",
+                           "Disp. conservadora Diamante": "#8E44AD",
                            "Disp. conservadora A": "#C0392B",
                            "Disp. conservadora B": "#E67E22",
                            "Disp. conservadora C": "#F1C40F",
@@ -4203,7 +4313,8 @@ def pagina_mrp_e002():
                                       "Disponibilidad conservadora (general)", "%"),
                                 use_container_width=True)
             with ce2:
-                clases = [c for c in ["Disp. conservadora A", "Disp. conservadora B",
+                clases = [c for c in ["Disp. conservadora Diamante",
+                                      "Disp. conservadora A", "Disp. conservadora B",
                                       "Disp. conservadora C",
                                       "Disp. conservadora Sin criticidad"]
                           if c in hist.columns]
@@ -4551,7 +4662,7 @@ def pagina_control():
         with f_col1:
             sel_crit_filtro = st.selectbox(
                 "Filtrar por Criticidad",
-                ["Todas", "Alta", "Baja", "Sin criticidad"],
+                ["Todas"] + ORDEN_CRITICIDAD,
                 index=0,
                 key="filtro_rapido_crit"
             )
@@ -5242,8 +5353,10 @@ def pagina_proveedores():
         # Filtro de criticidad (aplica a la tabla de materiales)
         crits = []
         if not mat.empty and "Criticidad texto" in mat.columns:
-            crits = sorted(str(x) for x in mat["Criticidad texto"].dropna().unique()
-                           if str(x).strip())
+            crits = sorted((str(x) for x in mat["Criticidad texto"].dropna().unique()
+                            if str(x).strip()),
+                           key=lambda v: ORDEN_CRITICIDAD.index(v)
+                           if v in ORDEN_CRITICIDAD else len(ORDEN_CRITICIDAD))
         f_crit = st.multiselect("Criticidad (materiales)", crits, default=crits,
                                 key="prov_crit_f") if crits else None
         if st.button("🔄 Recalcular", key="rec_prov"):
@@ -5632,6 +5745,10 @@ def pagina_cargar():
         ("OTIF — Activación 2.0", "OTIF", CARPETA_OTIF, False,
          "Archivo Activacion 2.0.xlsx de la carpeta de Activación · Seguimiento de "
          "OC (Base de datos). Se usa tal cual, sin modificarlo."),
+        ("Criticidad — Valorizado y rotación", "CRITICIDAD", CARPETA_CRITICIDAD, True,
+         "Excel con las columnas Material y Valorizado (Diamante, A, B o C). "
+         "Reemplaza la criticidad que trae el MRP semanal en todo el panel. "
+         "Los materiales que no estén en la lista quedan Sin criticidad."),
     ]
     st.info("📌 El **MRP semanal** y el **MB5B** se **acumulan**: cada archivo nuevo "
             "se suma a los anteriores para poder ver la evolución en el tiempo. "
