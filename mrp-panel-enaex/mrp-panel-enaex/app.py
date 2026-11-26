@@ -1712,8 +1712,10 @@ def historial_semanal(mrp=None) -> pd.DataFrame:
             "Bajo stock": int((cond == "Bajo Stock").sum()),
             "Con OC": int(tiene_oc.sum()),
             "Con Solped": int(tiene_sol.sum()),
-            "Solped bloqueada": int(obs.str.contains("bloque").sum()),
-            "Validación": int(obs.str.contains("validac").sum()),
+            # Mismas reglas que la tabla (un material bloqueado "por no validación"
+            # cuenta solo como bloqueado, no en ambos).
+            "Solped bloqueada": int((_estado_gestion_vec(g) == "Solped bloqueada").sum()),
+            "Validación": int((_estado_gestion_vec(g) == "Validación").sum()),
         }
         # Disponibilidad CONSERVADORA: solo Stock OK o Sobre Stock cuentan como
         # disponible (=1). Bajo Stock y Quiebre cuentan como no disponible (=0).
@@ -3465,7 +3467,7 @@ def _delta(actual, previo, invertir=True):
     """
     if previo is None or pd.isna(previo):
         return None
-    d = actual - previo
+    d = round(actual - previo, 2)
     if d == 0:
         return "0 vs sem. anterior"
     return f"{d:+g} vs sem. anterior"
@@ -4248,6 +4250,17 @@ def _kpi_con_lupa(col, kpi, valor, semana, sem_prev, actual, filtros,
     KPI con una lupita al lado del título. Al hacer clic en la lupa se abre la
     ventana "Qué movió este indicador" (solo si hay semana anterior).
     """
+    sin_cambio = isinstance(delta, str) and delta.startswith("0 ")
+    if sin_cambio:  # variación cero: gris y sin flecha (no rojo ni verde)
+        delta, delta_color = "= " + delta, "off"
+    extra = {}
+    if sin_cambio:
+        try:
+            import inspect
+            if "delta_arrow" in inspect.signature(st.metric).parameters:
+                extra["delta_arrow"] = "off"
+        except Exception:
+            pass
     with col:
         if sem_prev:
             # Título + lupa como un botón "plano" (sin borde), del tamaño del título
@@ -4257,9 +4270,9 @@ def _kpi_con_lupa(col, kpi, valor, semana, sem_prev, actual, filtros,
                              help=ayuda or f"Ver qué materiales movieron «{kpi}» vs {sem_prev}"):
                     _ver_cambios(kpi, semana, sem_prev, actual, filtros)
             st.metric(kpi, valor, delta=delta, delta_color=delta_color,
-                      label_visibility="collapsed")
+                      label_visibility="collapsed", **extra)
         else:
-            st.metric(kpi, valor, delta=delta, delta_color=delta_color, help=ayuda)
+            st.metric(kpi, valor, delta=delta, delta_color=delta_color, help=ayuda, **extra)
 
 
 # Estilo de la lupita: mismo tamaño y color gris que el título de un KPI normal,
@@ -4337,58 +4350,62 @@ def pagina_mrp_e002():
         st.caption(f"📅 Semana **{semana}**"
                    + (f" · comparada con **{sem_prev}**" if sem_prev else ""))
 
-    # Datos de la semana anterior para las comparaciones
-    prev = None
-    if sem_prev:
+    # KPI de la semana elegida y de la ANTERIOR, calculados con las MISMAS reglas
+    # y los MISMOS filtros de la barra lateral. Así la flecha "vs sem. anterior"
+    # siempre cuadra con lo que muestra la lupa.
+    def _valores_kpi(d):
+        n = len(d)
+        cond = d["Condicion Stock"].astype(str)
+        quiebre = int((cond == "Quiebre Stock").sum())
+        return {
+            "Materiales": n,
+            "Disponibilidad": round(100 * (n - quiebre) / n, 2) if n else 0,
+            "Disponibilidad conservadora": round(
+                100 * cond.isin(["Stock OK", "Sobre Stock"]).mean(), 2) if n else 0,
+            "Sin stock": quiebre,
+            "OC atrasadas": int((d["Estado OC"] == "Atrasada").sum()),
+            "OC en curso": int((d["Estado OC"] == "En curso").sum()),
+            "Solped bloqueadas": int((d["Estado gestión"] == "Solped bloqueada").sum()),
+            "En validación": int((d["Estado gestión"] == "Validación").sum()),
+        }
+
+    actual_kpi = _valores_kpi(datos)
+    previo_kpi = None
+    # Con el filtro "Estancados" activo no se compara (no tiene sentido semana a semana)
+    if sem_prev and est_col is None:
         try:
-            hist = cargar_historial()
-            fila = hist[hist["Semana"] == sem_prev]
-            prev = fila.iloc[0] if len(fila) else None
+            previo_df = _cargar_abast_al_corte(_firma_datos(), sem_prev)
+            for col, sel in filtros_ab:
+                previo_df = aplicar_filtro(previo_df, col, sel)
+            previo_kpi = _valores_kpi(previo_df)
         except Exception:
-            prev = None
+            previo_kpi = None
 
-    total = len(datos)
-    sin_stock = int((datos["Condicion Stock"] == "Quiebre Stock").sum())
-    dispo = round(100 * (total - sin_stock) / total, 1) if total else 0
-    # Disponibilidad conservadora: cuentan como disponibles SOLO los materiales en
-    # "Stock OK" o "Sobre Stock" (Bajo Stock no se considera disponible).
-    dispo_cons = round(
-        100 * datos["Condicion Stock"].isin(["Stock OK", "Sobre Stock"]).mean(), 1
-    ) if total else 0
-    atrasadas = int((datos["Estado OC"] == "Atrasada").sum())
-    bloq = int((datos["Estado gestión"] == "Solped bloqueada").sum())
-    valid = int((datos["Estado gestión"] == "Validación").sum())
-
-    prev_cons = None
-    if prev is not None:
-        for _c in ("Disponibilidad conservadora", "disponibilidad_conservadora"):
-            if _c in prev.index:
-                prev_cons = prev[_c]
-                break
+    def _d(nombre):
+        return _delta(actual_kpi[nombre], previo_kpi[nombre]) if previo_kpi else None
 
     st.markdown(CSS_KPI_LUPA, unsafe_allow_html=True)
     k = st.columns(8)
     args = (semana, sem_prev, datos, filtros_ab)
-    _kpi_con_lupa(k[0], "Materiales", f"{total:,}".replace(",", "."), *args)
-    _kpi_con_lupa(k[1], "Disponibilidad", f"{dispo} %", *args,
-                  delta=_delta(dispo, prev["Disponibilidad"] if prev is not None else None))
-    _kpi_con_lupa(k[2], "Disponibilidad conservadora", f"{dispo_cons} %", *args,
+    _kpi_con_lupa(k[0], "Materiales", f"{actual_kpi['Materiales']:,}".replace(",", "."), *args,
+                  delta=_d("Materiales"))
+    _kpi_con_lupa(k[1], "Disponibilidad", f"{actual_kpi['Disponibilidad']:.1f} %", *args,
+                  delta=_d("Disponibilidad"))
+    _kpi_con_lupa(k[2], "Disponibilidad conservadora",
+                  f"{actual_kpi['Disponibilidad conservadora']:.1f} %", *args,
                   titulo="Disp. conservadora",
-                  delta=_delta(dispo_cons, prev_cons),
+                  delta=_d("Disponibilidad conservadora"),
                   ayuda="Solo cuentan como disponibles los materiales en Stock OK o "
                         "Sobre Stock (Bajo Stock no se considera disponible). "
                         "Haz clic para ver qué materiales la movieron.")
-    _kpi_con_lupa(k[3], "Sin stock", sin_stock, *args,
-                  delta=_delta(sin_stock, prev["Sin stock"] if prev is not None else None),
-                  delta_color="inverse")
-    _kpi_con_lupa(k[4], "OC atrasadas", atrasadas, *args)
-    _kpi_con_lupa(k[5], "OC en curso", int((datos["Estado OC"] == "En curso").sum()), *args)
-    _kpi_con_lupa(k[6], "Solped bloqueadas", bloq, *args,
-                  delta=_delta(bloq, prev["Solped bloqueada"] if prev is not None else None),
-                  delta_color="inverse")
-    _kpi_con_lupa(k[7], "En validación", valid, *args,
-                  delta=_delta(valid, prev["Validación"] if prev is not None else None),
-                  delta_color="inverse")
+    for i, nombre in [(3, "Sin stock"), (4, "OC atrasadas"), (5, "OC en curso"),
+                      (6, "Solped bloqueadas"), (7, "En validación")]:
+        _kpi_con_lupa(k[i], nombre, actual_kpi[nombre], *args, delta=_d(nombre),
+                      delta_color="normal" if nombre == "OC en curso" else "inverse")
+    # Variables que usa el resto de la página
+    atrasadas = actual_kpi["OC atrasadas"]
+    bloq = actual_kpi["Solped bloqueadas"]
+    valid = actual_kpi["En validación"]
 
     t1, t2, t3, t4, t5 = st.tabs(["📌  Gestión (solped / OC)", "📊  Resumen",
                                   "📈  Evolución semanal", "📦  Demanda vs Stock",
