@@ -4059,15 +4059,42 @@ else:  # Streamlit muy antiguo: se muestra en la misma página
     _ver_cambios = _contenido_cambios
 
 
-def _boton_cambios(col, kpi, semana, sem_prev, actual, filtros):
-    """Botón '🔍 Ver cambios' bajo un KPI (solo si hay semana anterior)."""
-    if not sem_prev:
-        return
+def _kpi_con_lupa(col, kpi, valor, semana, sem_prev, actual, filtros,
+                  delta=None, delta_color="normal", ayuda=None, titulo=None):
+    """
+    KPI con una lupita al lado del título. Al hacer clic en la lupa se abre la
+    ventana "Qué movió este indicador" (solo si hay semana anterior).
+    """
     with col:
-        if st.button("🔍 Ver cambios", key=f"cmb_{kpi}", use_container_width=True,
-                     help=f"Materiales que hicieron cambiar «{kpi}» vs {sem_prev}"):
-            _ver_cambios(kpi, semana, sem_prev, actual, filtros)
+        if sem_prev:
+            # Título + lupa como un botón "plano" (sin borde), del tamaño del título
+            with st.container(key=f"kpitit_{kpi.replace(' ', '_')}"):
+                if st.button(f"{titulo or kpi} :material/search:", key=f"cmb_{kpi}",
+                             type="tertiary",
+                             help=ayuda or f"Ver qué materiales movieron «{kpi}» vs {sem_prev}"):
+                    _ver_cambios(kpi, semana, sem_prev, actual, filtros)
+            st.metric(kpi, valor, delta=delta, delta_color=delta_color,
+                      label_visibility="collapsed")
+        else:
+            st.metric(kpi, valor, delta=delta, delta_color=delta_color, help=ayuda)
 
+
+# Estilo de la lupita: mismo tamaño y color gris que el título de un KPI normal;
+# se oscurece al pasar el mouse.
+CSS_KPI_LUPA = """
+<style>
+div[class*="st-key-kpitit_"] button {
+    padding: 0; min-height: 0; height: auto; justify-content: flex-start;
+}
+div[class*="st-key-kpitit_"] button p {
+    font-size: 0.875rem; opacity: 0.6; white-space: nowrap;
+}
+div[class*="st-key-kpitit_"] button:hover p { opacity: 1; }
+div[class*="st-key-kpitit_"] button span[data-testid="stIconMaterial"] {
+    font-size: 1rem; vertical-align: -2px;
+}
+</style>
+"""
 
 # ==========================================================================
 #  PÁGINA · MRP E002 (abastecimiento)
@@ -4153,31 +4180,29 @@ def pagina_mrp_e002():
                 prev_cons = prev[_c]
                 break
 
+        st.markdown(CSS_KPI_LUPA, unsafe_allow_html=True)
     k = st.columns(8)
-    k[0].metric("Materiales", f"{total:,}".replace(",", "."))
-    k[1].metric("Disponibilidad", f"{dispo} %",
-                delta=_delta(dispo, prev["Disponibilidad"] if prev is not None else None))
-    k[2].metric("Disponibilidad conservadora", f"{dispo_cons} %",
-                delta=_delta(dispo_cons, prev_cons),
-                help="Solo cuentan como disponibles los materiales en Stock OK o "
-                     "Sobre Stock (Bajo Stock no se considera disponible)")
-    k[3].metric("Sin stock", sin_stock,
-                delta=_delta(sin_stock, prev["Sin stock"] if prev is not None else None),
-                delta_color="inverse")
-    k[4].metric("OC atrasadas", atrasadas)
-    k[5].metric("OC en curso", int((datos["Estado OC"] == "En curso").sum()))
-    k[6].metric("Solped bloqueadas", bloq,
-                delta=_delta(bloq, prev["Solped bloqueada"] if prev is not None else None),
-                delta_color="inverse")
-    k[7].metric("En validación", valid,
-                delta=_delta(valid, prev["Validación"] if prev is not None else None),
-                delta_color="inverse")
-    # Botón bajo cada KPI: qué materiales lo hicieron cambiar vs la semana anterior
-    for i, nombre_kpi in enumerate(["Materiales", "Disponibilidad",
-                                    "Disponibilidad conservadora", "Sin stock",
-                                    "OC atrasadas", "OC en curso",
-                                    "Solped bloqueadas", "En validación"]):
-        _boton_cambios(k[i], nombre_kpi, semana, sem_prev, datos, filtros_ab)
+    args = (semana, sem_prev, datos, filtros_ab)
+    _kpi_con_lupa(k[0], "Materiales", f"{total:,}".replace(",", "."), *args)
+    _kpi_con_lupa(k[1], "Disponibilidad", f"{dispo} %", *args,
+                  delta=_delta(dispo, prev["Disponibilidad"] if prev is not None else None))
+    _kpi_con_lupa(k[2], "Disponibilidad conservadora", f"{dispo_cons} %", *args,
+                  titulo="Disp. conservadora",
+                  delta=_delta(dispo_cons, prev_cons),
+                  ayuda="Solo cuentan como disponibles los materiales en Stock OK o "
+                        "Sobre Stock (Bajo Stock no se considera disponible). "
+                        "Haz clic para ver qué materiales la movieron.")
+    _kpi_con_lupa(k[3], "Sin stock", sin_stock, *args,
+                  delta=_delta(sin_stock, prev["Sin stock"] if prev is not None else None),
+                  delta_color="inverse")
+    _kpi_con_lupa(k[4], "OC atrasadas", atrasadas, *args)
+    _kpi_con_lupa(k[5], "OC en curso", int((datos["Estado OC"] == "En curso").sum()), *args)
+    _kpi_con_lupa(k[6], "Solped bloqueadas", bloq, *args,
+                  delta=_delta(bloq, prev["Solped bloqueada"] if prev is not None else None),
+                  delta_color="inverse")
+    _kpi_con_lupa(k[7], "En validación", valid, *args,
+                  delta=_delta(valid, prev["Validación"] if prev is not None else None),
+                  delta_color="inverse")
 
     t1, t2, t3, t4, t5 = st.tabs(["📌  Gestión (solped / OC)", "📊  Resumen",
                                   "📈  Evolución semanal", "📦  Demanda vs Stock",
