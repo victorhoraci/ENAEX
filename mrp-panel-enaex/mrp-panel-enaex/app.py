@@ -4817,6 +4817,8 @@ def pagina_mrp_e002():
                 t_[4].metric("Últ. solicitud",
                              f"{info['Días desde última solicitud']:.0f} d atrás"
                              if pd.notna(info.get("Días desde última solicitud")) else "—")
+            if semana:
+                linea_tiempo_material(info["Material"], info.get("Centro"), semana)
             with st.expander("Ver todos los datos de este material"):
                 st.dataframe(ficha_material(info), use_container_width=True,
                              hide_index=True)
