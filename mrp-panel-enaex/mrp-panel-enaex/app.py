@@ -3884,6 +3884,191 @@ def pagina_demanda():
                        file_name="mrp_demanda.csv", mime="text/csv")
 
 
+# --------------------------------------------------------------------------
+# "Ver cambios" de los KPI del MRP E002: qué materiales movieron cada KPI
+# entre la semana elegida y la anterior.
+# --------------------------------------------------------------------------
+@st.cache_data(show_spinner="Cargando la semana anterior para comparar…")
+def _cargar_abast_al_corte(_firma, semana):
+    """
+    Tabla de abastecimiento de una semana PASADA, calculada a la fecha de ese
+    MRP (no a hoy). Así una OC cuenta como 'Atrasada' solo si ya lo estaba
+    en esa semana.
+    """
+    fecha = None
+    try:
+        todas = cargar_mrp()
+        f = todas.loc[todas["Semana"] == semana, "Fecha MRP"].max()
+        fecha = f if pd.notna(f) else None
+    except Exception:
+        fecha = None
+    return construir_abastecimiento(semana=semana, hoy=fecha).tabla
+
+
+def _es_quiebre(d):
+    return d["Condicion Stock"].astype(str) == "Quiebre Stock"
+
+
+# Qué conjunto de materiales define cada KPI y cómo se explica.
+#   en    -> máscara: True si el material "está dentro" del KPI esa semana
+#   col   -> columna cuyo antes → ahora se muestra
+#   entra / sale -> título de cada lista
+#   denom -> True si el KPI es un % (los nuevos / eliminados mueven el total)
+KPI_CAMBIOS = {
+    "Materiales": dict(
+        en=lambda d: pd.Series(True, index=d.index), col="Condicion Stock",
+        entra="🆕 Nuevos en el MRP", sale="❌ Ya no están en el MRP", denom=False,
+        explica="Materiales que aparecieron o desaparecieron del MRP."),
+    "Disponibilidad": dict(
+        en=_es_quiebre, col="Condicion Stock",
+        entra="⬇️ Entraron a Quiebre Stock (bajan la disponibilidad)",
+        sale="⬆️ Salieron de Quiebre Stock (suben la disponibilidad)", denom=True,
+        explica="Disponibilidad = materiales que NO están en Quiebre Stock / total."),
+    "Disponibilidad conservadora": dict(
+        en=lambda d: ~d["Condicion Stock"].isin(["Stock OK", "Sobre Stock"]),
+        col="Condicion Stock",
+        entra="⬇️ Pasaron a NO disponible: Bajo Stock o Quiebre (bajan el KPI)",
+        sale="⬆️ Pasaron a disponible: Stock OK o Sobre Stock (suben el KPI)", denom=True,
+        explica="Solo cuentan como disponibles Stock OK y Sobre Stock."),
+    "Sin stock": dict(
+        en=_es_quiebre, col="Condicion Stock",
+        entra="🔴 Entraron a Quiebre Stock", sale="🟢 Salieron de Quiebre Stock",
+        denom=False, explica="Materiales en Quiebre Stock."),
+    "OC atrasadas": dict(
+        en=lambda d: d["Estado OC"].astype(str) == "Atrasada", col="Estado OC",
+        entra="🔴 Nuevas OC atrasadas", sale="🟢 Dejaron de estar atrasadas",
+        denom=False,
+        explica="OC con fecha de entrega vencida. La semana anterior se evalúa a la "
+                "fecha de ese MRP; la actual, a hoy."),
+    "OC en curso": dict(
+        en=lambda d: d["Estado OC"].astype(str) == "En curso", col="Estado OC",
+        entra="➕ Pasaron a tener OC en curso", sale="➖ Dejaron de tener OC en curso",
+        denom=False, explica="OC en tránsito con fecha de entrega aún vigente."),
+    "Solped bloqueadas": dict(
+        en=lambda d: d["Estado gestión"].astype(str) == "Solped bloqueada",
+        col="Estado gestión",
+        entra="🔴 Nuevas solped bloqueadas", sale="🟢 Se desbloquearon / ya no están",
+        denom=False, explica="Materiales con la solped bloqueada (según la Observación)."),
+    "En validación": dict(
+        en=lambda d: d["Estado gestión"].astype(str) == "Validación",
+        col="Estado gestión",
+        entra="🟠 Entraron a validación", sale="🟢 Salieron de validación",
+        denom=False, explica="Materiales en validación (según la Observación)."),
+}
+
+
+def _comparar_kpi(actual: pd.DataFrame, previo: pd.DataFrame, kpi: str):
+    """
+    Cruza la semana actual con la anterior por Material + Centro y devuelve
+    (entran, salen, solo_total): DataFrames listos para mostrar.
+    """
+    cfg = KPI_CAMBIOS[kpi]
+    llave = ["Material", "Centro"]
+    extras = ["Texto breve de material", "Criticidad texto", "Criticidad Prillex",
+              "Solped", "OC en Transito"]
+
+    def prep(d):
+        d = d.drop_duplicates(subset=llave).copy()
+        out = d[llave].copy()
+        out["en"] = cfg["en"](d).fillna(False).astype(bool).values
+        out["estado"] = d[cfg["col"]].astype(str).values if cfg["col"] in d.columns else ""
+        for c in extras:
+            out[c] = d[c].values if c in d.columns else None
+        return out
+
+    a, p = prep(actual), prep(previo)
+    m = a.merge(p, on=llave, how="outer", suffixes=("", "_ant"), indicator=True)
+    esta_a = m["_merge"] != "right_only"
+    esta_p = m["_merge"] != "left_only"
+    en_a = m["en"].where(esta_a, False).astype(bool)
+    en_p = m["en_ant"].where(esta_p, False).astype(bool)
+    for c in extras:  # datos descriptivos: los de hoy, o los de la semana pasada
+        m[c] = m[c].where(esta_a, m[f"{c}_ant"])
+
+    m["Antes"] = m["estado_ant"].where(esta_p, "— no estaba en el MRP")
+    m["Ahora"] = m["estado"].where(esta_a, "— ya no está en el MRP")
+    m["Motivo"] = np.where(~esta_p, "Nuevo en el MRP",
+                           np.where(~esta_a, "Salió del MRP", "Cambió de estado"))
+
+    cols = ["Material", "Texto breve de material", "Criticidad texto",
+            "Criticidad Prillex", "Antes", "Ahora", "Motivo"]
+    if kpi in ("OC atrasadas", "OC en curso"):
+        cols.append("OC en Transito")
+    if kpi in ("Solped bloqueadas", "En validación"):
+        cols.append("Solped")
+
+    def vista(mask):
+        v = m.loc[mask, cols].copy()
+        orden = v["Criticidad Prillex"].map(
+            lambda x: ORDEN_CRIT_PRILLEX.index(x) if x in ORDEN_CRIT_PRILLEX else 99)
+        v = v.assign(_o=orden).sort_values(["_o", "Material"]).drop(columns="_o")
+        return v.rename(columns={"Texto breve de material": "Descripción",
+                                 "Criticidad texto": "Criticidad",
+                                 "OC en Transito": "OC"}).reset_index(drop=True)
+
+    entran = vista(en_a & ~en_p)
+    salen = vista(en_p & ~en_a)
+    # En los KPI en %, los materiales nuevos / eliminados que no entran ni salen
+    # del conjunto igual mueven el total (el denominador).
+    solo_total = vista((~esta_p | ~esta_a) & ~(en_a ^ en_p)) if cfg["denom"] \
+        else vista(pd.Series(False, index=m.index))
+    return entran, salen, solo_total
+
+
+def _contenido_cambios(kpi, semana, sem_prev, actual, filtros):
+    cfg = KPI_CAMBIOS[kpi]
+    st.markdown(f"#### {kpi}")
+    st.caption(f"Semana **{semana}** comparada con **{sem_prev}**. {cfg['explica']}")
+    try:
+        previo = _cargar_abast_al_corte(_firma_datos(), sem_prev)
+    except Exception as e:
+        st.error(f"No se pudo cargar la semana anterior: {e}")
+        return
+    for col, sel in filtros:  # mismos filtros de la barra lateral
+        previo = aplicar_filtro(previo, col, sel)
+
+    entran, salen, solo_total = _comparar_kpi(actual, previo, kpi)
+    if entran.empty and salen.empty and solo_total.empty:
+        st.success("Sin cambios vs la semana anterior.")
+        return
+
+    c = st.columns(3 if cfg["denom"] else 2)
+    c[0].metric(cfg["entra"].split(" (")[0], len(entran))
+    c[1].metric(cfg["sale"].split(" (")[0], len(salen))
+    if cfg["denom"]:
+        c[2].metric("Solo cambian el total", len(solo_total))
+
+    for titulo, tabla in [(cfg["entra"], entran), (cfg["sale"], salen)]:
+        st.markdown(f"**{titulo}** · {len(tabla)}")
+        if tabla.empty:
+            st.caption("Ninguno.")
+        else:
+            st.dataframe(tabla, use_container_width=True, hide_index=True)
+    if cfg["denom"] and not solo_total.empty:
+        st.markdown(f"**➕➖ Nuevos o eliminados del MRP (solo cambian el total)** · "
+                    f"{len(solo_total)}")
+        st.caption("No entraron ni salieron del grupo, pero al cambiar el total de "
+                   "materiales mueven el porcentaje.")
+        st.dataframe(solo_total, use_container_width=True, hide_index=True)
+
+
+_DIALOGO = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+if _DIALOGO is not None:
+    _ver_cambios = _DIALOGO("🔍 Qué movió este indicador", width="large")(_contenido_cambios)
+else:  # Streamlit muy antiguo: se muestra en la misma página
+    _ver_cambios = _contenido_cambios
+
+
+def _boton_cambios(col, kpi, semana, sem_prev, actual, filtros):
+    """Botón '🔍 Ver cambios' bajo un KPI (solo si hay semana anterior)."""
+    if not sem_prev:
+        return
+    with col:
+        if st.button("🔍 Ver cambios", key=f"cmb_{kpi}", use_container_width=True,
+                     help=f"Materiales que hicieron cambiar «{kpi}» vs {sem_prev}"):
+            _ver_cambios(kpi, semana, sem_prev, actual, filtros)
+
+
 # ==========================================================================
 #  PÁGINA · MRP E002 (abastecimiento)
 # ==========================================================================
@@ -3924,10 +4109,11 @@ def pagina_mrp_e002():
             st.rerun()
 
     datos = tabla.copy()
-    for col, sel in [("Centro", f_centro), ("Area", f_area), ("Criticidad texto", f_crit),
-                     ("Criticidad Prillex", f_cprx),
-                     ("Condicion Stock", f_cond), ("Estado gestión", f_gest),
-                     ("Estado OC", f_oc), ("Nacionalidad", f_nac), ("Recurrencia", f_rec)]:
+    filtros_ab = [("Centro", f_centro), ("Area", f_area), ("Criticidad texto", f_crit),
+                  ("Criticidad Prillex", f_cprx),
+                  ("Condicion Stock", f_cond), ("Estado gestión", f_gest),
+                  ("Estado OC", f_oc), ("Nacionalidad", f_nac), ("Recurrencia", f_rec)]
+    for col, sel in filtros_ab:
         datos = aplicar_filtro(datos, col, sel)
 
     if datos.empty:
@@ -3986,6 +4172,12 @@ def pagina_mrp_e002():
     k[7].metric("En validación", valid,
                 delta=_delta(valid, prev["Validación"] if prev is not None else None),
                 delta_color="inverse")
+    # Botón bajo cada KPI: qué materiales lo hicieron cambiar vs la semana anterior
+    for i, nombre_kpi in enumerate(["Materiales", "Disponibilidad",
+                                    "Disponibilidad conservadora", "Sin stock",
+                                    "OC atrasadas", "OC en curso",
+                                    "Solped bloqueadas", "En validación"]):
+        _boton_cambios(k[i], nombre_kpi, semana, sem_prev, datos, filtros_ab)
 
     t1, t2, t3, t4, t5 = st.tabs(["📌  Gestión (solped / OC)", "📊  Resumen",
                                   "📈  Evolución semanal", "📦  Demanda vs Stock",
