@@ -4250,17 +4250,10 @@ def _kpi_con_lupa(col, kpi, valor, semana, sem_prev, actual, filtros,
     KPI con una lupita al lado del título. Al hacer clic en la lupa se abre la
     ventana "Qué movió este indicador" (solo si hay semana anterior).
     """
-    sin_cambio = isinstance(delta, str) and delta.startswith("0 ")
-    if sin_cambio:  # variación cero: gris y sin flecha (no rojo ni verde)
-        delta, delta_color = "= " + delta, "off"
+    # Sin variación vs la semana anterior: no se muestra nada
+    if isinstance(delta, str) and delta.startswith("0 "):
+        delta = None
     extra = {}
-    if sin_cambio:
-        try:
-            import inspect
-            if "delta_arrow" in inspect.signature(st.metric).parameters:
-                extra["delta_arrow"] = "off"
-        except Exception:
-            pass
     with col:
         if sem_prev:
             # Título + lupa como un botón "plano" (sin borde), del tamaño del título
