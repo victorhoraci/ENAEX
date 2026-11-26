@@ -2006,6 +2006,69 @@ def _estado_gestion(row) -> str:
     return "Sin gestión"
 
 
+def _estado_gestion_vec(df: pd.DataFrame) -> pd.Series:
+    """Igual que _estado_gestion, pero para toda la tabla de una vez (más rápido)."""
+    def col(c):
+        return df[c] if c in df.columns else pd.Series(None, index=df.index)
+    obs = col("Observación").fillna("").astype(str).str.lower()
+    tiene = lambda c: ~col(c).astype(str).str.strip().isin(["", "None", "nan", "<NA>"]) & col(c).notna()
+    return pd.Series(np.select(
+        [obs.str.contains("bloque"), obs.str.contains("validac"),
+         tiene("OC en Transito"), tiene("Solped")],
+        ["Solped bloqueada", "Validación", "Con OC", "Con Solped"],
+        default="Sin gestión"), index=df.index)
+
+
+# Columnas nuevas: cuántas semanas SEGUIDAS lleva el material en el mismo estado
+COL_SEM_STOCK = "Semanas así (stock)"
+COL_SEM_GEST = "Semanas así (gestión)"
+
+
+def historia_estados(todas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Una fila por Material + Centro + Semana con su estado de stock y de gestión,
+    a partir de TODOS los MRP semanales cargados.
+    """
+    if todas.attrs.get("ya_es_historia"):
+        return todas
+    h = todas[["Material", "Centro", "Semana"]].copy()
+    h["Condicion Stock"] = todas["Condicion Stock"].astype(str) \
+        if "Condicion Stock" in todas.columns else ""
+    h["Estado gestión"] = _estado_gestion_vec(todas)
+    return h.dropna(subset=["Semana"]).drop_duplicates(
+        subset=["Material", "Centro", "Semana"], keep="last")
+
+
+def rachas_estado(todas: pd.DataFrame, semana: str) -> pd.DataFrame:
+    """
+    Para cada Material + Centro de la semana elegida: cuántas semanas seguidas
+    (hasta esa semana) lleva con el MISMO estado de stock y de gestión, y desde
+    qué semana. Si el material no aparece en una semana, la racha se corta ahí.
+    """
+    h = historia_estados(todas)
+    semanas = sorted(s for s in h["Semana"].unique() if s and s <= semana)
+    salida = None
+    for col, nombre in [("Condicion Stock", "stock"), ("Estado gestión", "gestión")]:
+        piv = h.pivot_table(index=["Material", "Centro"], columns="Semana",
+                            values=col, aggfunc="last")
+        piv = piv.reindex(columns=semanas)
+        if semana not in piv.columns:
+            continue
+        actual = piv[semana]
+        racha = actual.notna().astype(int)
+        sigue = actual.notna()
+        desde = pd.Series(semana, index=piv.index).where(actual.notna())
+        for sem in reversed(semanas[:-1]):
+            sigue = sigue & (piv[sem] == actual)
+            racha = racha + sigue.astype(int)
+            desde = desde.where(~sigue, sem)
+        r = pd.DataFrame({f"Semanas así ({nombre})": racha,
+                          f"Desde ({nombre})": desde}).reset_index()
+        r = r[actual.notna().values]
+        salida = r if salida is None else salida.merge(r, on=["Material", "Centro"], how="outer")
+    return salida if salida is not None else pd.DataFrame(columns=["Material", "Centro"])
+
+
 # --------------------------------------------------------------------------
 # Integración
 # --------------------------------------------------------------------------
@@ -2078,6 +2141,15 @@ def construir_abastecimiento(
     # --- Derivaciones ---
     base["Material_Centro"] = base["Material"].astype(str) + "_" + base["Centro"].astype(str)
     base["Estado gestión"] = base.apply(_estado_gestion, axis=1)
+    # Semanas seguidas en el mismo estado (de stock y de gestión)
+    if semana:
+        try:
+            rach = rachas_estado(todas, semana)[["Material", "Centro",
+                                                 COL_SEM_STOCK, COL_SEM_GEST]]
+            base = base.merge(rach, on=["Material", "Centro"], how="left")
+        except Exception:
+            base[COL_SEM_STOCK] = np.nan
+            base[COL_SEM_GEST] = np.nan
     # Área vacía -> BODEGA (para que esos materiales sean visibles y filtrables)
     if "Area" in base.columns:
         base["Area"] = base["Area"].fillna("BODEGA").astype(str).str.strip()
@@ -3420,6 +3492,30 @@ def filtro_multi(datos, col, etiqueta, key):
     return st.multiselect(etiqueta, opciones, default=opciones, key=key)
 
 
+def filtro_estancados(key: str):
+    """
+    Filtro de la barra lateral: materiales que llevan al menos N semanas
+    seguidas en el mismo estado (de stock o de gestión).
+    Devuelve (columna, mínimo) o (None, None) si no se filtra.
+    """
+    st.markdown("**Estancados**")
+    tipo = st.selectbox("Mismo estado de…", ["(sin filtro)", "Stock", "Gestión"],
+                        key=f"{key}_tipo",
+                        help="Muestra solo los materiales que llevan varias semanas "
+                             "seguidas en el mismo estado.")
+    if tipo == "(sin filtro)":
+        return None, None
+    n = st.number_input("Mínimo de semanas", min_value=1, max_value=60, value=4,
+                        step=1, key=f"{key}_n")
+    return (COL_SEM_STOCK if tipo == "Stock" else COL_SEM_GEST), int(n)
+
+
+def aplicar_estancados(datos, col, minimo):
+    if col is None or col not in datos.columns:
+        return datos
+    return datos[pd.to_numeric(datos[col], errors="coerce").fillna(0) >= minimo]
+
+
 def aplicar_filtro(datos, col, seleccion):
     """Aplica la selección de filtro_multi respetando los '(sin dato)'."""
     if seleccion is None or col not in datos.columns:
@@ -3888,6 +3984,93 @@ def pagina_demanda():
 # "Ver cambios" de los KPI del MRP E002: qué materiales movieron cada KPI
 # entre la semana elegida y la anterior.
 # --------------------------------------------------------------------------
+@st.cache_data(show_spinner="Leyendo la historia semanal de estados…")
+def _cargar_historia_estados(_firma):
+    return historia_estados(cargar_mrp())
+
+
+COLOR_HIST = {  # fondo, texto
+    "Quiebre Stock": ("#FDECEA", "#B71C1C"), "Bajo Stock": ("#FFF4E0", "#9A5B00"),
+    "Stock OK": ("#E8F5E9", "#1B5E20"), "Sobre Stock": ("#E3F2FD", "#0D47A1"),
+    "Validación": ("#FFF4E0", "#9A5B00"), "Solped bloqueada": ("#FDECEA", "#B71C1C"),
+    "Con Solped": ("#E3F2FD", "#0D47A1"), "Con OC": ("#E8F5E9", "#1B5E20"),
+    "Sin gestión": ("#F1F1F1", "#555555"),
+}
+CORTO_HIST = {"Quiebre Stock": "Quiebre", "Bajo Stock": "Bajo", "Stock OK": "OK",
+              "Sobre Stock": "Sobre", "Validación": "Validac.",
+              "Solped bloqueada": "Bloqueada", "Con Solped": "Solped",
+              "Con OC": "OC", "Sin gestión": "Sin gest."}
+
+
+def linea_tiempo_material(material, centro, semana, n=12):
+    """Línea de tiempo (últimas n semanas) del estado de stock y de gestión."""
+    try:
+        h = _cargar_historia_estados(_firma_datos())
+    except Exception:
+        return
+    h = h[(h["Material"] == material) & (h["Centro"] == centro)]
+    todas_sem = sorted(s for s in _cargar_historia_estados(_firma_datos())["Semana"].unique()
+                       if s <= semana)[-n:]
+    if h.empty or not todas_sem:
+        return
+    h = h.set_index("Semana")
+
+    def celda(valor):
+        if valor is None or pd.isna(valor):
+            return ('<div style="height:26px;border-radius:4px;background:#F7F7F7;'
+                    'color:#999;font-size:11px;display:flex;align-items:center;'
+                    'justify-content:center">—</div>')
+        bg, fg = COLOR_HIST.get(valor, ("#F1F1F1", "#555"))
+        return (f'<div title="{valor}" style="height:26px;border-radius:4px;background:{bg};'
+                f'color:{fg};font-size:11px;display:flex;align-items:center;'
+                f'justify-content:center;white-space:nowrap;overflow:hidden">'
+                f'{CORTO_HIST.get(valor, valor)}</div>')
+
+    cols = f"grid-template-columns:120px repeat({len(todas_sem)},minmax(0,1fr))"
+    fila = lambda contenido: (f'<div style="display:grid;{cols};gap:3px;align-items:center;'
+                              f'margin-bottom:4px">{contenido}</div>')
+    etiqueta = lambda t: f'<div style="font-size:12px;color:#666">{t}</div>'
+    cab = etiqueta("") + "".join(
+        f'<div style="font-size:11px;color:#999;text-align:center">{s.split("-")[-1]}</div>'
+        for s in todas_sem)
+    filas = [fila(cab)]
+    for col, nombre in [("Condicion Stock", "Estado del stock"), ("Estado gestión", "Gestión")]:
+        vals = [h[col].get(s) if s in h.index else None for s in todas_sem]
+        filas.append(fila(etiqueta(nombre) + "".join(celda(v) for v in vals)))
+    st.markdown(f"**Historia de las últimas {len(todas_sem)} semanas**")
+    st.markdown("".join(filas), unsafe_allow_html=True)
+
+    # Resumen: cuánto lleva en el estado actual
+    try:
+        r = rachas_estado(cargar_mrp_historia_cache(), semana)
+    except Exception:
+        r = None
+    if r is not None:
+        r = r[(r["Material"] == material) & (r["Centro"] == centro)]
+        if len(r):
+            r = r.iloc[0]
+            partes = []
+            for nombre, col_est in [("stock", "Condicion Stock"), ("gestión", "Estado gestión")]:
+                n_sem = r.get(f"Semanas así ({nombre})")
+                desde = r.get(f"Desde ({nombre})")
+                est = h[col_est].get(semana) if semana in h.index else None
+                if pd.notna(n_sem) and est:
+                    partes.append(f"**{est}** hace {int(n_sem)} semana{'s' if n_sem != 1 else ''}"
+                                  f" (desde {str(desde).split('-')[-1]})")
+            if partes:
+                st.caption(" · ".join(partes))
+
+
+def cargar_mrp_historia_cache():
+    """
+    Historia de estados ya calculada (en caché), marcada para que
+    rachas_estado la use tal cual sin volver a leer los MRP.
+    """
+    h = _cargar_historia_estados(_firma_datos()).copy()
+    h.attrs["ya_es_historia"] = True
+    return h
+
+
 @st.cache_data(show_spinner="Cargando la semana anterior para comparar…")
 def _cargar_abast_al_corte(_firma, semana):
     """
@@ -4079,8 +4262,8 @@ def _kpi_con_lupa(col, kpi, valor, semana, sem_prev, actual, filtros,
             st.metric(kpi, valor, delta=delta, delta_color=delta_color, help=ayuda)
 
 
-# Estilo de la lupita: mismo tamaño y color gris que el título de un KPI normal;
-# se oscurece al pasar el mouse.
+# Estilo de la lupita: mismo tamaño y color gris que el título de un KPI normal,
+# y la lupa se pone azul al pasar el mouse.
 CSS_KPI_LUPA = """
 <style>
 div[class*="st-key-kpitit_"] button {
@@ -4095,6 +4278,7 @@ div[class*="st-key-kpitit_"] button span[data-testid="stIconMaterial"] {
 }
 </style>
 """
+
 
 # ==========================================================================
 #  PÁGINA · MRP E002 (abastecimiento)
@@ -4131,6 +4315,7 @@ def pagina_mrp_e002():
         f_oc = filtro_multi(tabla, "Estado OC", "Estado de la OC", "ab_OC")
         f_nac = filtro_multi(tabla, "Nacionalidad", "Nacionalidad de la OC", "ab_Nac")
         f_rec = filtro_multi(tabla, "Recurrencia", "Recurrencia de compra (TAT)", "ab_Rec")
+        est_col, est_min = filtro_estancados("ab_est")
         if st.button("🔄 Recargar datos", key="rec_ab"):
             st.cache_data.clear()
             st.rerun()
@@ -4142,6 +4327,7 @@ def pagina_mrp_e002():
                   ("Estado OC", f_oc), ("Nacionalidad", f_nac), ("Recurrencia", f_rec)]
     for col, sel in filtros_ab:
         datos = aplicar_filtro(datos, col, sel)
+    datos = aplicar_estancados(datos, est_col, est_min)
 
     if datos.empty:
         st.warning("Ningún material coincide con los filtros.")
@@ -4180,7 +4366,7 @@ def pagina_mrp_e002():
                 prev_cons = prev[_c]
                 break
 
-        st.markdown(CSS_KPI_LUPA, unsafe_allow_html=True)
+    st.markdown(CSS_KPI_LUPA, unsafe_allow_html=True)
     k = st.columns(8)
     args = (semana, sem_prev, datos, filtros_ab)
     _kpi_con_lupa(k[0], "Materiales", f"{total:,}".replace(",", "."), *args)
@@ -4254,8 +4440,8 @@ def pagina_mrp_e002():
         else:
             cols_p = [c for c in ["Material", "Texto breve de material", "Centro", "Area",
                                   "Criticidad texto", "Criticidad Prillex",
-                                  "Condicion Stock", "Stock",
-                                  "Estado gestión", "Observación",
+                                  "Condicion Stock", COL_SEM_STOCK, "Stock",
+                                  "Estado gestión", COL_SEM_GEST, "Observación",
                                   "Comentario compra y seguimiento", "Solped",
                                   "Días en solped", "Usuario"] if c in prio.columns]
             st.dataframe(prio[cols_p].sort_values(["Estado gestión", "Material"]),
@@ -4284,7 +4470,8 @@ def pagina_mrp_e002():
             else:
                 cols_s = [c for c in ["Material", "Texto breve de material", "Solped",
                                       "Días en solped", "TAT Promedio", "Tiempo demanda (días)",
-                                      "Urgencia OC", "Condicion Stock", "Criticidad texto",
+                                      "Urgencia OC", "Condicion Stock", COL_SEM_STOCK,
+                                      COL_SEM_GEST, "Criticidad texto",
                                       "Criticidad Prillex",
                                       "Comentario compra y seguimiento"]
                           if c in sol.columns]
@@ -4552,7 +4739,8 @@ def pagina_mrp_e002():
                 cols_d = [c for c in ["Material", "Texto breve de material", "Stock",
                                       "Punto de Reorden", "Pronostico_Consolidado",
                                       "Tiempo_Prox_Demanda", "Cumple_Demanda",
-                                      "Tipo_demanda", "Estado gestión", "TAT Promedio"]
+                                      "Tipo_demanda", "Estado gestión", COL_SEM_GEST,
+                                      "TAT Promedio"]
                           if c in crit.columns]
                 if crit.empty:
                     st.success("Todos los materiales con pronóstico cubren su próxima demanda.")
@@ -4625,6 +4813,12 @@ def pagina_mrp_e002():
             st.markdown("---")
 
         vista = datos.drop(columns=["etiqueta"], errors="ignore").sort_values("Material")
+        orden_cols = [c for c in vista.columns if c not in (COL_SEM_STOCK, COL_SEM_GEST)]
+        for nueva, junto_a in [(COL_SEM_STOCK, "Condicion Stock"), (COL_SEM_GEST, "Estado gestión")]:
+            if nueva in vista.columns:
+                pos = orden_cols.index(junto_a) + 1 if junto_a in orden_cols else len(orden_cols)
+                orden_cols.insert(pos, nueva)
+        vista = vista[orden_cols]
         vista = buscar_en_tabla(vista, "buscar_ab_todos")
         st.dataframe(vista, use_container_width=True, hide_index=True)
         st.download_button("⬇️  Descargar tabla completa (CSV)",
@@ -4651,12 +4845,12 @@ COLS_CONTROL = [
     "Material", "Texto breve de material", "Centro", "Area", "Grupo de compras",
     "Criticidad texto", "Criticidad Prillex",
     # 2) Stock y su estado
-    "Stock", "Punto de Reorden", "Condicion Stock",
+    "Stock", "Punto de Reorden", "Condicion Stock", COL_SEM_STOCK,
     # 3) Demanda y cobertura
     "Tipo_demanda", "Pronostico_Consolidado", "Tiempo_hasta_demanda_txt",
     "Stock tras demanda", "Resultado demanda",
     # 4) Gestión (solped / OC)
-    "Estado gestión", "Solped", "Cantidad Solped", "Días en solped",
+    "Estado gestión", COL_SEM_GEST, "Solped", "Cantidad Solped", "Días en solped",
     "OC en Transito", "Cantidad en Transito", "Días de OC", "Estado OC",
     "Días atraso OC", "Nacionalidad",
     # 5) TAT
@@ -4778,6 +4972,7 @@ def pagina_control():
         f_cond = filtro_multi(datos, "Condicion Stock", "Estado del stock", "ctl_Cond")
         f_res = filtro_multi(datos, "Resultado demanda", "¿Cumple la demanda?", "ctl_Res")
         f_gest = filtro_multi(datos, "Estado gestión", "Gestión (solped / OC)", "ctl_Gest")
+        est_col, est_min = filtro_estancados("ctl_est")
         if st.button("🔄 Recargar datos", key="rec_ctl"):
             st.cache_data.clear()
             st.rerun()
@@ -4787,6 +4982,7 @@ def pagina_control():
                      ("Condicion Stock", f_cond), ("Resultado demanda", f_res),
                      ("Estado gestión", f_gest)]:
         datos = aplicar_filtro(datos, col, sel)
+    datos = aplicar_estancados(datos, est_col, est_min)
 
     if datos.empty:
         st.warning("Ningún material coincide con los filtros.")
@@ -4970,7 +5166,7 @@ def pagina_control():
                 "Pronostico_Consolidado", "Stock tras demanda", "Resultado demanda",
                 "Tiempo_hasta_demanda_txt", "TAT Promedio",
                 "Holgura días (demanda - TAT)", "Acción de compra",
-                "Estado gestión"] if c in plan.columns]
+                "Estado gestión", COL_SEM_GEST] if c in plan.columns]
             renombre_p = dict(RENOMBRE_CONTROL)
             renombre_p.update({
                 "Cantidad en Transito": "Cant. en camino",
@@ -5010,6 +5206,8 @@ def pagina_control():
         c[2].metric("Estado del stock", str(info.get("Condicion Stock", "—")))
         c[3].metric("Criticidad", str(info.get("Criticidad texto", "—")))
         st.caption(f"Criticidad Prillex: **{info.get('Criticidad Prillex', '—')}**")
+        if semana:
+            linea_tiempo_material(info["Material"], info.get("Centro"), semana)
 
         c = st.columns(4)
         pron = info.get("Pronostico_Consolidado")
